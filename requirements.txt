@@ -4,6 +4,9 @@
 # Web framework and ASGI server
 fastapi==0.115.6
 uvicorn==0.32.1
+# Direct import in the domain models (Pydantic v2 validators and types);
+# previously installed transitively through FastAPI.
+pydantic==2.14.2
 
 # Testing
 pytest==8.3.4

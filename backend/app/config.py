@@ -1,0 +1,64 @@
+"""Runtime configuration read from environment variables.
+
+Settings fail closed. An unset environment is treated as production, so the
+development-only simulation endpoint stays off unless someone opts in with
+both an explicit development environment and an explicit enable flag.
+
+The simulation endpoint has no authentication. The guard in ``Settings`` makes
+it impossible to build a production configuration that exposes it, so the
+endpoint cannot be switched on in production by accident. Lifting the guard
+requires the authentication design in docs/architecture.md, not a config change.
+"""
+
+from collections.abc import Mapping
+from enum import StrEnum
+from typing import Any, Self
+
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+
+ENVIRONMENT_VARIABLE = "AEGIS_ENVIRONMENT"
+SIMULATION_API_VARIABLE = "AEGIS_SIMULATION_API_ENABLED"
+
+
+class Environment(StrEnum):
+    """Deployment environment the process is running in."""
+
+    DEVELOPMENT = "development"
+    PRODUCTION = "production"
+
+
+class ConfigurationError(RuntimeError):
+    """Raised when environment variables describe an unsafe or invalid setup."""
+
+
+class Settings(BaseModel):
+    """Validated runtime settings. An unsafe combination cannot be constructed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    environment: Environment = Environment.PRODUCTION
+    simulation_api_enabled: bool = False
+
+    @model_validator(mode="after")
+    def _simulation_api_is_development_only(self) -> Self:
+        """Refuse to enable the unauthenticated simulation endpoint in production."""
+        if self.simulation_api_enabled and self.environment is Environment.PRODUCTION:
+            raise ValueError(
+                "the simulation API has no authentication and is development-only; "
+                "it cannot be enabled when the environment is production"
+            )
+        return self
+
+
+def load_settings(environ: Mapping[str, str]) -> Settings:
+    """Build settings from environment variables, failing closed on bad input."""
+    raw: dict[str, Any] = {}
+    if ENVIRONMENT_VARIABLE in environ:
+        raw["environment"] = environ[ENVIRONMENT_VARIABLE]
+    if SIMULATION_API_VARIABLE in environ:
+        raw["simulation_api_enabled"] = environ[SIMULATION_API_VARIABLE]
+    try:
+        return Settings.model_validate(raw)
+    except ValidationError as error:
+        reasons = "; ".join(str(problem["msg"]) for problem in error.errors())
+        raise ConfigurationError(f"invalid configuration: {reasons}") from error
