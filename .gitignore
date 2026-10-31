@@ -1,0 +1,65 @@
+# ---------------------------------------------------------------
+# AEGIS AI .gitignore
+# ---------------------------------------------------------------
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Secrets and credentials: never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+secrets/
+credentials.json
+*.kdbx
+
+# Oracle wallets and connection artifacts (for future database work)
+wallet/
+tnsnames.ora
+sqlnet.ora
+
+# Logs and temporary files
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+~$*
+
+# Build and packaging output
+build/
+dist/
+*.egg-info/
+
+# Editors and operating system files
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Frontend dependencies and build output (for future use)
+node_modules/
+frontend/dist/
+frontend/build/
