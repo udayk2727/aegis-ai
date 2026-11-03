@@ -6,7 +6,15 @@ from fastapi.testclient import TestClient
 def test_all_public_routes_are_registered(client: TestClient) -> None:
     paths = set(client.get("/openapi.json").json()["paths"])
 
-    assert paths == {"/", "/health", "/api/v1/simulations", "/api/v1/events"}
+    assert paths == {
+        "/",
+        "/health",
+        "/api/v1/simulations",
+        "/api/v1/events",
+        "/api/v1/analytics/summary",
+        "/api/v1/analytics/baselines",
+        "/api/v1/analytics/timeseries",
+    }
 
 
 def test_every_route_declares_a_response_model(client: TestClient) -> None:

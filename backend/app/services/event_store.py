@@ -95,6 +95,20 @@ class EventStore:
             self._stored_events += run_event_count
             return True
 
+    def matching_events(self, event_filter: EventFilter) -> list[TelemetryEvent]:
+        """Return every stored event that matches, in insertion order.
+
+        Used by analytics, which needs whole series rather than a page. The
+        result is bounded by the store capacity, so it cannot grow without limit.
+        """
+        with self._lock:
+            return [
+                event
+                for run in self._runs.values()
+                for event in run.events
+                if event_filter.matches(event)
+            ]
+
     def query(
         self,
         event_filter: EventFilter,
@@ -106,11 +120,5 @@ class EventStore:
 
         Events come back in insertion order: by run, then by tick.
         """
-        with self._lock:
-            matches = [
-                event
-                for run in self._runs.values()
-                for event in run.events
-                if event_filter.matches(event)
-            ]
+        matches = self.matching_events(event_filter)
         return matches[offset : offset + limit], len(matches)

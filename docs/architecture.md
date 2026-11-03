@@ -229,7 +229,7 @@ against. Full usage, examples, and limitations are in the
 - **Thread safety.** Endpoints run in FastAPI's thread pool, so the store
   guards its state with a lock.
 
-### Known gaps
+### Known gaps (simulation)
 
 - No persistence and no shared store between processes.
 - Stationary baseline distributions; no seasonality or bursts.
@@ -239,3 +239,101 @@ against. Full usage, examples, and limitations are in the
   the database adapter.
 - `POST /api/v1/simulations` is a state-changing endpoint without an accepted
   authorization design (see section 5).
+
+## 11. Telemetry analytics and statistical baselines
+
+Status: **Implemented, read-only, in memory.** Analytics turns stored telemetry
+into descriptive statistics and normal-operation baselines. It exists before
+any anomaly detector so that each later detector is scored against the same
+ground truth and the same, documented baseline. Usage and examples are in the
+[README](../README.md#analytics).
+
+### Components
+
+| Module | Responsibility | Framework imports |
+|--------|----------------|-------------------|
+| `app/services/statistics.py` | Quantiles, sample standard deviation, descriptive and rolling statistics | None |
+| `app/services/analytics.py` | Series grouping by service, metric, and unit; single-series rolling analytics | None |
+| `app/services/baseline.py` | Normal-labelled baseline selection and the train/evaluation split | None |
+| `app/routers/analytics.py` | Three read-only endpoints and their Pydantic contracts | FastAPI, Pydantic |
+
+The statistics modules are pure functions. The router converts their results
+into response models and holds no statistical logic, so the numbers can be
+tested without HTTP.
+
+### Decisions
+
+- **Sample standard deviation** (divisor n − 1). It is the estimator a
+  detector needs when it generalizes from a sample. Population deviation would
+  understate spread on small samples. It is `null` below two values, because a
+  single value has no spread.
+- **Linear quantiles** (R-7). This matches NumPy and pandas, so results can be
+  checked against them.
+- **Groups by (service, metric, unit).** A unit is part of the identity, so a
+  mean can never combine milliseconds with percent.
+- **Missing values are excluded and counted; invalid values are rejected.**
+  Missing is `null`. NaN, infinity, booleans, and strings raise an error and are
+  never silently coerced.
+- **Rolling windows are trailing and incomplete windows carry `null`.** A
+  partial window is not reported as a full one. Rolling statistics reject
+  missing values rather than skipping them, because skipping would shift the
+  window.
+- **Rolling statistics require one series from one run.** A window across
+  services or runs would mix unrelated timelines, so the service raises
+  instead of computing it. The endpoint enforces this by filtering first.
+- **Baselines use ground-truth labels only to select normal data.** The
+  baseline carries no labels. Analytics responses never return a per-event
+  label, but label isolation is partial: the summary's `is_anomalous` and
+  `scenario_id` filters return label-derived aggregates. Labels are kept only
+  where scoring needs them, in the evaluation side of the split.
+- **Labels are never ML features.** Future inference must not use
+  `is_anomalous`, `scenario_id`, or any value derived from them as an input.
+  They select normal data and score predictions only.
+- **Training and evaluation are separated by run and by time.** Runs must be
+  disjoint. Training data is strictly before the cutoff, and evaluation data is
+  at or after it. A UTC cutoff is required so the comparison is unambiguous.
+  `TrainEvaluationSplit.training_baseline` builds the training reference from
+  the training side only, so a held-out run cannot change it.
+- **Exploratory analytics stay separate from evaluation.** The
+  `/api/v1/analytics/baselines` endpoint uses every stored run by default and
+  is for inspection. Evaluation workflows use `training_baseline` instead. The
+  endpoint's contract is unchanged.
+- **Bounded responses.** Summaries are bounded by the topology (at most nine
+  series). Timeseries pages are capped at 500 points, the window at 60, and the
+  baseline selection at 20 runs.
+- **No thresholds.** Analytics computes statistics and makes no alert decision.
+
+### Endpoints
+
+| Method and path | Purpose | Bounds |
+|-----------------|---------|--------|
+| `GET /api/v1/analytics/summary` | Statistics per series, with filters including `is_anomalous` | Topology-bounded |
+| `GET /api/v1/analytics/baselines` | Normal-only baseline with sample count and source run IDs | ≤ 20 `run_id`s |
+| `GET /api/v1/analytics/timeseries` | One series from one run, with rolling statistics | Window 2–60; limit 1–500 |
+
+Every endpoint is read-only and needs no authorization decision under section 5,
+because it changes no state. Section 5 still applies to the simulation endpoint.
+
+### Limitations
+
+- Statistics are computed over the in-memory store, which is lost on restart.
+- The baseline assumes stationary normal behaviour. The simulator has no
+  seasonality, so a real baseline would need time-of-day or weekly structure.
+- Labels cover each whole fault window, not each metric. Some normal-labelled
+  events are affected by a fault in another metric, so the baseline is
+  slightly contaminated. This is a known limitation of the simulator.
+- Summaries and baselines scan the whole store, which is bounded at 50,000
+  events. An index belongs with the database adapter.
+- Label isolation is partial. The `is_anomalous` and `scenario_id` filters on
+  the summary, and on `/api/v1/events`, let a caller learn label-derived counts
+  and statistics. Restricting or removing those filters is an owner decision,
+  not yet made.
+
+### Visualization
+
+`scripts/plot_telemetry.py` produces offline PNG charts under `artifacts/plots/`.
+It uses pandas and Matplotlib, which are pinned in `requirements-analytics.txt`
+rather than `requirements.txt`. They are optional because the API, its tests,
+and its deployment never import them, so the core install stays free of numpy
+and a plotting stack. The script calls the same services as the API. The charts
+are not committed.

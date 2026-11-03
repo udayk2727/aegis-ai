@@ -1,0 +1,7 @@
+# Store text with LF line endings and check out LF on every platform, so Python
+# and Markdown files do not gain CRLF endings on Windows.
+* text=auto eol=lf
+
+# Binary files must never be converted.
+*.png binary
+*.pyc binary

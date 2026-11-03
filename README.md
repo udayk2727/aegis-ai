@@ -22,6 +22,12 @@ Available now:
 - `POST /api/v1/simulations`: run a deterministic simulation with a seeded
   scenario and store its events in memory (see [Simulation](#simulation))
 - `GET /api/v1/events`: page through stored events with filters
+- `GET /api/v1/analytics/summary`: descriptive statistics per service, metric,
+  and unit (see [Analytics](#analytics))
+- `GET /api/v1/analytics/baselines`: normal-operation baseline statistics
+- `GET /api/v1/analytics/timeseries`: one run's series with rolling statistics
+- Offline charts from `scripts/plot_telemetry.py` (see
+  [Running visualizations](#running-visualizations))
 - Automated tests with pytest
 
 Planned (see [docs/architecture.md](docs/architecture.md)):
@@ -51,8 +57,9 @@ aegis-ai/
 │   ├── app/          Application package
 │   │   ├── domain/       Pydantic telemetry models (no I/O)
 │   │   ├── routers/      HTTP endpoints, one module per feature
-│   │   └── services/     Simulation engine and event store
+│   │   └── services/     Simulation engine, event store, and analytics
 │   └── tests/        pytest suite
+├── scripts/          Offline analysis scripts (charts)
 ├── frontend/         Placeholder for the user interface
 ├── infrastructure/   Placeholder for deployment assets
 ├── docs/             Architecture documentation
@@ -85,6 +92,9 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
+
+The core API needs only `requirements.txt`. The offline charts have their own
+optional file; see [Running visualizations](#running-visualizations).
 
 ### 3. Run the API
 
@@ -321,6 +331,155 @@ Each tick emits 9 events (`EVENTS_PER_TICK`), so a run emits `ticks × 9`.
   through the API.
 - **Pagination is offset-based and scans linearly.** Fine at the store's size,
   but not for large volumes.
+
+## Analytics
+
+The analytics layer turns stored telemetry into statistics that a future anomaly
+detector can be measured against. Its endpoints are read-only and change no
+state. The layer does not detect anything yet.
+
+### Why analytics comes before anomaly detection
+
+A detector's output is only meaningful relative to what normal looks like. Before
+any model is trained, the project needs known-good distributions per metric,
+a reproducible split between data used to learn normal and data used to judge
+it, and rolling statistics that show how a metric moves over time. Building
+these first lets each later detector be scored on the same ground truth and
+the same baseline, which makes its results comparable.
+
+### Statistics and conventions
+
+Every series is identified by `(service, metric_name, unit)`. Statistics are
+never computed across series, so latencies in milliseconds and counts or
+percentages cannot be combined by accident.
+
+| Statistic | Definition |
+|-----------|------------|
+| `sample_count` | Number of finite, non-missing values |
+| `missing_count` | Values excluded because they were `null` |
+| `mean` | Sum divided by count, with compensated summation |
+| `median` | Equal to `p50` |
+| `minimum`, `maximum` | Smallest and largest value |
+| `stdev` | Sample standard deviation, divisor n − 1; `null` when n < 2 |
+| `p50`, `p95`, `p99` | Quantiles with linear interpolation (R-7, the NumPy and pandas default): position `h = (n − 1) · q`, interpolated between the two surrounding order statistics |
+
+Edge cases:
+
+- **Empty sample:** every statistic is `null` and `sample_count` is 0.
+- **Single value:** mean, median, minimum, maximum, and percentiles equal that
+  value; `stdev` is `null`, not 0, because a single value has no spread.
+- **Zero variance:** `stdev` is exactly 0.
+- **Missing values:** excluded and counted separately.
+- **NaN, infinity, booleans, strings:** rejected with an error. They never
+  reach a statistic.
+
+Rolling statistics use a trailing window of `window` values, configurable from
+2 to 60 (default 5). Until the window is full, `mean` and `stdev` are `null`
+and `window_count` reports how many values exist, so a partial window is never
+mistaken for a full one. A window of zero variance has `stdev` 0.
+
+### Baselines and leakage control
+
+A baseline is built only from events whose ground-truth label is not anomalous.
+Labels are used to choose the normal data, and the baseline carries no labels.
+The response reports the sample count, the source run IDs, and the selection
+method, so a result can be traced to its inputs.
+
+A `TrainEvaluationSplit` keeps training and evaluation apart:
+
+- training and evaluation use disjoint runs, so a model never scores a run it
+  learned from;
+- training data is normal-labelled and strictly before a UTC cutoff;
+- evaluation data comes from the held-out runs at or after the cutoff.
+
+Exploratory and evaluation baselines are kept separate:
+
+- `GET /api/v1/analytics/baselines` is for inspecting normal behaviour. Without
+  `run_id` it uses every stored run, so it can include runs that an evaluation
+  holds out. Its behaviour is unchanged for compatibility.
+- An evaluation workflow must build its reference with
+  `TrainEvaluationSplit.training_baseline(events)`. It uses only the training
+  runs, normal-labelled and strictly before the cutoff, so a held-out run cannot
+  change it. The tests in `backend/tests/test_baseline.py` check this.
+
+### Analytics endpoints
+
+All three are `GET`, read-only, and bounded. They never return a per-event
+ground-truth label. They can still reveal label-derived information: the
+`is_anomalous` and `scenario_id` filters on the summary return counts and
+statistics that depend on the labels (for example, `event_count` with
+`is_anomalous=true`). Use those filters to compare distributions, not as a
+source of answers. Label isolation is not complete.
+
+**`GET /api/v1/analytics/summary`** — statistics per series for the events that
+match the filters. Filters: `run_id`, `scenario_id`, `service`, `metric_name`,
+and `is_anomalous`. Use `is_anomalous` to compare normal and incident
+distributions. The number of series is bounded by the topology (at most nine).
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8000/api/v1/analytics/summary?is_anomalous=false"
+```
+
+**`GET /api/v1/analytics/baselines`** — normal-operation baseline. Optional
+`run_id` (repeat up to 20 times) and `before` (an RFC 3339 timestamp with an
+offset) limit the source events.
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8000/api/v1/analytics/baselines?before=2026-01-01T00:10:00Z"
+```
+
+**`GET /api/v1/analytics/timeseries`** — one page of one series from one run,
+with rolling statistics. Required: `run_id`, `service`, `metric_name`. Optional:
+`window` (2 to 60, default 5), `limit` (1 to 500, default 100), `offset`. The
+rolling window is computed over the whole series before paging, so each page
+carries the same statistics. An unmatched combination returns an empty page
+with `total` 0.
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8000/api/v1/analytics/timeseries?run_id=sim-f0d42ee8093d2f22&service=orders-db&metric_name=db_query_latency_ms&window=5&limit=20"
+```
+
+### Running visualizations
+
+The charts use pandas and Matplotlib. They are listed in
+`requirements-analytics.txt`, not `requirements.txt`, because the API, its tests,
+and its deployment never import them. Keeping them optional stops the core
+install from pulling in numpy and a plotting stack. Install both files into the
+same virtual environment:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-analytics.txt
+python scripts\plot_telemetry.py
+```
+
+The script writes five PNG files to `artifacts/plots/` (ignored by Git):
+`db_query_latency.png`, `api_response_latency.png`, `cpu_utilization.png`,
+`latency_distribution.png` (normal vs incident), and
+`rolling_mean_baseline.png` (rolling mean against a baseline from a separate
+normal run). It uses fixed seeds, so reruns produce the same images.
+
+### Assumptions and limitations
+
+- Sample standard deviation and linear quantiles are conventions, chosen to match
+  NumPy and pandas. Another convention gives slightly different percentiles.
+- Baselines assume the simulator's stationary normal distribution. Real systems
+  have seasonality and bursts that a single baseline does not capture.
+- Labels mark each whole fault window, not each metric, so a normal-labelled
+  event can still be affected by a fault in another metric. Baselines inherit
+  that imprecision.
+- Summaries and baselines read the whole in-memory store, which is bounded at
+  50,000 events. Timeseries pages are computed over one run's series and are
+  bounded by the 288-tick limit.
+- Label isolation is partial. Label-filtered aggregates are reachable through
+  the summary's `is_anomalous` and `scenario_id` filters, as they are through
+  `/api/v1/events`.
+- Future ML inference must not use `is_anomalous`, `scenario_id`, or any value
+  derived from them as an input feature. Labels select normal data and score
+  predictions; they are never model inputs.
+- Nothing here sets alert thresholds. Thresholds belong to a later, documented
+  detector, and each must state its assumptions.
 
 ## Configuration
 

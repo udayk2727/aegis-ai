@@ -1,0 +1,8 @@
+# Optional: offline visualization only (scripts/plot_telemetry.py).
+# Not needed to run, test, or deploy the API, so it is kept out of
+# requirements.txt. Install with:
+#   python -m pip install -r requirements-analytics.txt
+# Requires the core requirements.txt to be installed first.
+
+pandas==3.1.0
+matplotlib==3.11.2

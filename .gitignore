@@ -36,6 +36,9 @@ wallet/
 tnsnames.ora
 sqlnet.ora
 
+# Generated analysis output (charts from scripts/plot_telemetry.py)
+artifacts/
+
 # Logs and temporary files
 *.log
 logs/
