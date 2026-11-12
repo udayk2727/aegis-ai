@@ -28,6 +28,8 @@ Available now:
 - `GET /api/v1/analytics/timeseries`: one run's series with rolling statistics
 - Offline charts from `scripts/plot_telemetry.py` (see
   [Running visualizations](#running-visualizations))
+- Statistical anomaly detectors (z-score and robust) as a Python library, with
+  held-out evaluation (see [Anomaly detection](#anomaly-detection))
 - Automated tests with pytest
 
 Planned (see [docs/architecture.md](docs/architecture.md)):
@@ -57,9 +59,9 @@ aegis-ai/
 │   ├── app/          Application package
 │   │   ├── domain/       Pydantic telemetry models (no I/O)
 │   │   ├── routers/      HTTP endpoints, one module per feature
-│   │   └── services/     Simulation engine, event store, and analytics
+│   │   └── services/     Simulation engine, event store, analytics, and detectors
 │   └── tests/        pytest suite
-├── scripts/          Offline analysis scripts (charts)
+├── scripts/          Offline analysis scripts (charts, detector evaluation)
 ├── frontend/         Placeholder for the user interface
 ├── infrastructure/   Placeholder for deployment assets
 ├── docs/             Architecture documentation
@@ -480,6 +482,112 @@ normal run). It uses fixed seeds, so reruns produce the same images.
   predictions; they are never model inputs.
 - Nothing here sets alert thresholds. Thresholds belong to a later, documented
   detector, and each must state its assumptions.
+
+## Anomaly detection
+
+Two statistical detectors score each telemetry event as `normal`, `anomalous`,
+or `unscored`. They are a Python library with no HTTP endpoint. A read-only API
+is proposed but not built; see
+[architecture §12.7](docs/architecture.md#127-proposed-read-only-detection-api-planned-not-implemented).
+The full algorithms, leakage rules, and evaluation definitions are in
+[architecture §12](docs/architecture.md#12-statistical-anomaly-detection).
+
+### Detectors
+
+| Detector | Center and spread | Score | Default threshold |
+|----------|-------------------|-------|-------------------|
+| `ZScoreDetector` | Training mean and sample stdev | `z = (x − mean) / stdev` | 3.0 |
+| `RobustDetector` | Training median and MAD | `M = 0.6745 · (x − median) / MAD` | 3.5 |
+
+Both accept a `direction`: `TWO_SIDED` (the default) flags values above or
+below normal, and `UPPER_TAIL` flags only values above. Both group events by
+`(service, metric_name, unit)` and need at least `min_training_samples`
+values per series (default 10).
+
+Unsupported input is never reported as normal. A series that was not in
+training, a series with too few training values, and a non-finite value each
+return `unscored` with a reason. A series whose training spread is zero
+(stdev or MAD is 0) flags any deviation with reason `zero_spread_deviation`,
+and has no score.
+
+### Using a detector
+
+Training and evaluation are separate steps. `run_experiment` enforces the
+split, so use it rather than calling `fit` and `predict` by hand:
+
+```python
+from datetime import timedelta
+
+from app.services.baseline import TrainEvaluationSplit
+from app.services.detectors import RobustConfig, RobustDetector
+from app.services.experiment import run_experiment
+
+report = run_experiment(
+    RobustDetector(RobustConfig(threshold=3.5)),
+    split,        # TrainEvaluationSplit: training runs before a cutoff, held-out runs after
+    events,       # TelemetryEvent objects from the simulator or the event store
+)
+print(report.metric_level.confusion, report.window_level.confusion)
+```
+
+`report.metric_level` scores each event against its label. `report.window_level`
+scores each held-out run as one decision, and reports detection delay in seconds.
+
+### Evaluation definitions
+
+- **Metric level:** every scored event is one decision. Ground truth is the
+  scenario-window label, which marks every metric in the fault window, so it is
+  not evidence that each metric deviated.
+- **Window level:** every held-out run is one decision. Alerts come from an
+  incident rule over the per-tick verdicts. The rule can require several affected
+  series and several consecutive ticks. The default rule alerts on any anomalous
+  verdict. Consecutive ticks must be one telemetry interval apart (60 seconds by
+  default), so a missing tick breaks the streak. A run is detected when an alert
+  falls inside its labelled fault window. Alerts before the window count as
+  metric-level false positives, are reported as pre-incident alerts, and do not
+  detect the window.
+- **Effect level:** an event is anomalous only if it is in a fault window and its
+  series is one the fault changes. This separates misses from metrics the fault
+  never moved.
+- **Detection delay:** seconds from the first anomalous tick of a window to the
+  first alert inside it. Resolution is one tick (60 seconds by default).
+- **Undefined rates:** precision, recall, F1, and false-positive rate are shown
+  as `n/a` when their denominator is zero. They are never 0 or 1 by default.
+- **Unscored events** are excluded from the matrices and counted separately.
+
+### Reproducing the experiment
+
+The script fits on fault-free training runs. It chooses one incident rule per
+detector on fifty validation runs, then selects the preferred detector on
+validation, and then scores 100 final runs once (seeds 401–420). Every seed is
+fixed. It needs only the core install:
+
+```powershell
+cd C:\Projects\aegis-ai
+.\.venv\Scripts\Activate.ps1
+python scripts\evaluate_detectors.py
+```
+
+Rerunning it prints identical output. The results and their limitations are in
+[architecture §12.8](docs/architecture.md#128-results-on-the-simulator). The
+main findings: the robust detector flags every nonzero count on sparse series
+whose training MAD is 0. Under the any-positive policy every normal run raised
+alerts. The chosen persistence rules alerted on no validation normal run, at the
+cost of detection delay. The preferred detector is the z-score upper-tail with
+series ≥ 3 and ticks ≥ 1, chosen on validation F1 and then delay. The robust
+upper-tail with series ≥ 3 and ticks ≥ 2 is kept as a comparison. Section 12.11
+gives the frozen final results.
+
+### Limitations
+
+- Results describe synthetic, stationary data with step faults. They are not
+  evidence about production telemetry.
+- Labels mark whole fault windows, so metric-level recall is capped by metrics
+  the fault does not change.
+- Detectors assume each series is stationary, and points are scored
+  independently. Real telemetry has seasonality, drift, and correlated ticks.
+- The zero-spread policy and the default thresholds were chosen before the
+  held-out evaluation and were not tuned on it.
 
 ## Configuration
 

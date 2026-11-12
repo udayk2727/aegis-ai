@@ -1,9 +1,11 @@
 # AEGIS AI Architecture
 
 **Status:** Draft. Describes the target architecture. Today the backend has the
-foundation (`GET /`, `GET /health`) and an in-memory simulation engine with
-`POST /api/v1/simulations` and `GET /api/v1/events` (section 10). Everything
-else below is planned and will be refined as each phase is implemented.
+foundation (`GET /`, `GET /health`), an in-memory simulation engine with
+`POST /api/v1/simulations` and `GET /api/v1/events` (section 10), read-only
+analytics and baselines (section 11), and offline statistical anomaly detection
+in the Python library (section 12). Everything else below is planned and will be
+refined as each phase is implemented.
 
 ## 1. Purpose
 
@@ -68,6 +70,7 @@ intended to:
 |------------------------|---------------------------------------------------------|---------|
 | API layer              | HTTP interface for the frontend and integrations        | Started |
 | Simulation engine      | Synthetic labelled telemetry for testing detection      | Started |
+| Statistical detection  | Z-score and robust detectors, held-out evaluation       | Started (library, offline) |
 | Ingestion              | Accept and normalize alerts, logs, and metrics          | Planned |
 | Correlation engine     | Group related signals into incidents                    | Planned |
 | Investigation agents   | Gather context and propose root-cause hypotheses        | Planned |
@@ -168,7 +171,7 @@ retrieval shape the database adapter will need, not a persistence design.
 | Phase | Goal                                          | Status      |
 |-------|-----------------------------------------------|-------------|
 | 0     | Project foundation, health endpoint, tests    | In progress |
-| 1     | Configuration, logging, and domain models     | Partial: telemetry models and simulation engine (section 10) |
+| 1     | Configuration, logging, and domain models     | Partial: telemetry models, simulation engine (section 10), analytics (section 11), detectors (section 12) |
 | 2     | Signal ingestion and incident correlation     | Planned     |
 | 3     | Authentication and authorization              | Planned     |
 | 4     | Investigation agents with LLM adapter         | Planned     |
@@ -337,3 +340,471 @@ rather than `requirements.txt`. They are optional because the API, its tests,
 and its deployment never import them, so the core install stays free of numpy
 and a plotting stack. The script calls the same services as the API. The charts
 are not committed.
+
+## 12. Statistical anomaly detection
+
+Status: **Implemented as a Python library, offline.** Two detectors are fitted
+on healthy training runs and scored on held-out runs, and the results are
+evaluated at two levels. No API endpoint exists for detection. The proposed
+read-only API is in section 12.7 and is **planned**. Usage is in the
+[README](../README.md#anomaly-detection).
+
+### 12.1 Components
+
+| Module | Responsibility | Framework imports |
+|--------|----------------|-------------------|
+| `app/services/detection.py` | Interface `AnomalyDetector` (`fit`, `predict`), `Prediction`, `Decision`, `Reason`, `Direction`, and the shared unsupported-input rules | None |
+| `app/services/detectors.py` | `ZScoreDetector` and `RobustDetector` with their configurations | None |
+| `app/services/evaluation.py` | Confusion matrix, rates, metric-level and window-level evaluation, detection delay | None |
+| `app/services/experiment.py` | `run_experiment`, the one sanctioned path from split to score | None |
+| `scripts/evaluate_detectors.py` | Reproduces the held-out experiment with fixed seeds | None (standard library) |
+
+No new dependency was added. The detectors use the statistics module from
+section 11.
+
+### 12.2 Interface contract
+
+- `fit(training_events)` learns one model per series. Refitting replaces the
+  previous model. A non-finite training value rejects the whole fit.
+- `predict(evaluation_events)` returns one `Prediction` per event, in input
+  order. It raises if the detector is unfitted.
+- Each `Prediction` has a `decision` of `anomalous`, `normal`, or `unscored`.
+  It also carries a `score`, which is `None` when no finite score exists, and a
+  `reason` for unscored or zero-spread verdicts.
+- Series are keyed by `(service, metric_name, unit)`, the same key as analytics.
+- Predictions are point-wise. A verdict depends on the fitted model and the one
+  event being scored. Scoring a prefix of the evaluation events gives the same
+  verdicts as scoring all of them, so no later observation influences an
+  earlier one.
+- Detectors never read `label`. Labels are used before `fit`, to choose
+  normal training events, and after `predict`, to score predictions.
+
+### 12.3 Algorithms
+
+**Z-score.** `z = (x − mean) / s`, where `mean` is the training mean and `s` is
+the sample standard deviation (divisor n − 1). Default threshold 3.0.
+
+**Robust.** `M = 0.6745 · (x − median) / MAD`, where `median` is the training
+median and `MAD` is the median of the absolute deviations from that median.
+The constant 0.6745 is the 0.75 quantile of the standard normal, so for normal
+data MAD ≈ 0.6745 σ and `M` is on the same scale as a z-score. The default
+threshold is 3.5, the Iglewicz and Hoaglin recommendation for `M`.
+
+**Direction.** `two_sided` scores `|z|` or `|M|`. `upper_tail` scores the
+signed value, so only values above normal are flagged. The threshold is
+compared with `>=`, as the severity thresholds are (section 10).
+
+**Ties.** Duplicate training values count at full multiplicity. The median of an
+even sample is the mean of the two middle values. The MAD therefore uses
+ordinary order statistics, with no tie-breaking rule. A worked example with
+values `1, 1, 2, 2, 3, 3` gives median 2 and MAD 1.
+
+### 12.4 Unsupported inputs and zero spread
+
+Every rule below returns `unscored` or flags explicitly. None returns `normal`
+by default.
+
+| Condition | Verdict | Reason |
+|-----------|---------|--------|
+| Series not in training | `unscored` | `unseen_series` |
+| Fewer than `min_training_samples` in training (default 10, minimum 2) | `unscored` | `insufficient_training_samples` |
+| Non-finite evaluation value | `unscored` | `invalid_value` |
+| Spread is zero (z-score: stdev 0; robust: MAD 0) and the value equals the center | `normal`, score 0 | none |
+| Spread is zero and the value deviates in a counted direction | `anomalous`, no score | `zero_spread_deviation` |
+
+The zero-spread rule is a policy. With no spread a standardized score is
+undefined, so the detector cannot say how far a value is from normal. It flags
+any deviation rather than dividing by zero or inventing a scale. Section 12.8
+gives the consequence observed on the simulator.
+
+Non-finite values are already rejected by the domain model (section 10). The
+detector checks them again as a second line of defence, because the domain
+model can be bypassed by constructing objects without validation.
+
+### 12.5 Training versus evaluation
+
+`run_experiment` is the only sanctioned pipeline:
+
+1. `TrainEvaluationSplit.training_events` returns normal-labelled events from
+   training runs strictly before the cutoff. This is the only place labels
+   choose data for a detector.
+2. `fit` receives those events and nothing else.
+3. `TrainEvaluationSplit.evaluation_events` returns events from held-out runs at
+   or after the cutoff.
+4. `predict` runs on those events. Labels are not read.
+5. The evaluation module reads labels and compares them with the predictions.
+
+Training and evaluation runs are disjoint, and the split validates that. Tests
+in `test_experiment.py` check that shifting every held-out value leaves the fitted
+model unchanged, and that the training selection never includes a held-out run.
+`test_detectors.py` checks that flipping every label leaves the fit and the
+predictions unchanged.
+
+### 12.6 Evaluation
+
+**Two levels, reported separately.**
+
+- *Metric level.* Each scored event is one decision. Ground truth is
+  `label.is_anomalous`. Results are pooled and also broken down per series.
+- *Window level.* Each evaluation run is one decision. A run is actually
+  anomalous if it contains an anomalous label. Alerts come from an
+  `IncidentRule` applied to the run's predictions (section 12.9). The default
+  rule alerts on any anomalous prediction. A run is predicted anomalous if an
+  alert falls inside its labelled window. For a normal run, any alert counts.
+  The window is the range from the first to the last anomalous timestamp,
+  inclusive. The window is derived from every labelled event in the run, scored
+  or not, so it reflects the ground truth as the simulator recorded it.
+- *Effect level.* Each scored event is anomalous only if it is inside a fault
+  window and its series is one the fault changes (`AFFECTED_SERIES` in
+  `evaluation.py`). This separates a detector miss from a metric the fault never
+  moved. It is a reporting annotation and is never an input to a detector.
+
+**Confusion matrix and rates.** `TP`, `FP`, `TN`, and `FN` are counted per
+level. The rates are:
+
+| Rate | Formula | Undefined when |
+|------|---------|----------------|
+| Precision | TP / (TP + FP) | Nothing was flagged |
+| Recall | TP / (TP + FN) | Nothing was anomalous |
+| F1 | 2TP / (2TP + FP + FN) | No positives on either side |
+| False-positive rate | FP / (FP + TN) | No normal decisions |
+
+An undefined rate is reported as `None` and never as 0 or 1. Where a rate is
+defined, F1 equals the harmonic mean of precision and recall, and a test checks
+that.
+
+**Unscored events.** They are excluded from every confusion matrix and counted
+in `unscored_count`. A run with no scored events is excluded and counted in
+`unscored_run_count`. Neither is counted as normal.
+
+**Detection delay.** For each detected anomalous run:
+
+- *Window start* is the first anomalous timestamp of the run.
+- *First alert* is the earliest `anomalous` prediction inside
+  `[window start, window end]`. Alerts before the window do not count for
+  detection, although they remain metric-level false positives.
+- *Delay* is `first alert − window start`, in seconds. Its resolution is the
+  tick interval, which is 60 seconds by default. A delay of 0 means the first
+  anomalous tick was flagged.
+
+The delay summary covers detected windows only. Undetected windows are visible
+through `FN`.
+
+### 12.7 Proposed read-only detection API (planned, not implemented)
+
+The owner asked for an optional read-only API after the architecture review.
+This section proposes it; no code exists.
+
+- `GET /api/v1/detection/evaluation` runs the held-out experiment on stored
+  runs and returns the `ExperimentReport` shape. Parameters are bounded:
+  detector name from an enum, a threshold from a range, a direction from an
+  enum, and a cutoff. The run IDs are enumerated and capped.
+- It changes no state. The model is fitted per request, in memory, and then
+  discarded.
+- **Training is not exposed.** No endpoint accepts training data or stores a
+  fitted model. Fitting through an unauthenticated public endpoint is excluded
+  by section 5.
+- It reads labels, so it inherits the label-isolation limitation in section 11.
+  Its response must say that the metric-level truth is the window label.
+- It is not registered until an authorization design is accepted, unless the
+  owner decides it may ship as read-only under the existing read-only rule in
+  section 5.
+
+Until that decision, the detector is used as a Python service, through
+`run_experiment` or the script.
+
+### 12.8 Results on the simulator
+
+This section records the first run, under the any-positive window policy. The
+rule-based results, with the validation and test split, are in section 12.9.
+Seeds 201 to 203 were retired after section 12.9 and are not used for any
+decision. The frozen final results are in section 12.11.
+
+`scripts/evaluate_detectors.py` runs four configurations on one split. The
+training runs are four fault-free runs with seeds 101 to 104, ending at the
+cutoff. The evaluation runs are fifteen runs with seeds 201 to 203, starting at
+the cutoff: for each seed, one fault-free run and one run per fault scenario,
+each 60 ticks. The thresholds were fixed before the experiment, from the
+defaults above, and were not tuned on the held-out results.
+
+| Configuration | Level | TP | FP | TN | FN | Precision | Recall | F1 | FPR |
+|---------------|-------|---:|---:|---:|---:|----------:|-------:|---:|----:|
+| z-score, two-sided | metric | 880 | 63 | 5877 | 1280 | 0.933 | 0.407 | 0.567 | 0.011 |
+| z-score, two-sided | window | 12 | 3 | 0 | 0 | 0.800 | 1.000 | 0.889 | 1.000 |
+| z-score, upper-tail | metric | 820 | 62 | 5878 | 1340 | 0.930 | 0.380 | 0.539 | 0.010 |
+| robust, two-sided | metric | 927 | 288 | 5652 | 1233 | 0.763 | 0.429 | 0.549 | 0.048 |
+| robust, upper-tail | metric | 867 | 288 | 5652 | 1293 | 0.751 | 0.401 | 0.523 | 0.048 |
+
+The window rows are identical for all four configurations (12 of 12 fault runs
+detected, 3 of 3 normal runs alerted). Detection delay was 0 s in every
+detected window, so the first anomalous tick is always flagged. Three normal
+runs give too few decisions to estimate a window-level false-positive rate.
+Read that cell as "every normal run alerted", not as a rate.
+
+What the numbers show:
+
+- **Metric-level recall is capped by the labels.** The fault-window label covers
+  every metric in the window, including metrics the fault does not change. For
+  example, `cpu_utilization_percent` on `orders-db` has 240 anomalous events
+  across the twelve fault runs and no alert in any run. None of the four fault
+  scenarios moves that metric out of its normal range, so those 240 are false
+  negatives by the label, not misses the detector could have caught.
+- **The robust detector flags sparse counts.** `http_error_count` is zero in
+  most normal ticks, so for those series the training MAD is 0. Under the
+  zero-spread rule every nonzero count is flagged. That accounts for 259 of the 288 robust
+  false positives. The z-score detector is less affected, but
+  `db_connection_failures` contributes 27 of its 63 false positives for the same
+  reason. Count metrics are a poor fit for a MAD-based detector.
+- **Every normal run raised alerts, many of them.** Across the three fault-free
+  runs, the z-score detector raised 63 false positives, about 21 per run, and the
+  robust detector raised 288, about 96 per run. A per-event rate of about 1%
+  looks small, but it is 540 events per run, so per-event rates understate the
+  operational burden.
+
+Owner decision needed: a zero-MAD fallback to the mean absolute deviation, as
+Iglewicz and Hoaglin suggest, would reduce the count-metric false positives. It
+is not implemented here. Changing the rule now would mean tuning on the
+held-out data this section reports, so it needs an independent evaluation run
+first.
+
+### 12.9 Incident decision layer
+
+**Why.** Under the any-positive policy, a run is an alert if any one of its
+metric verdicts is anomalous. In the first run, each of the three healthy runs
+had four to eight alarms. Most came from count metrics, where a Poisson count of
+one or two can score above the threshold. One such alarm is enough, so the run-level
+false-positive rate was 1.0.
+
+**Design.** `app/services/incident.py` defines `IncidentRule(min_affected_series,
+min_consecutive_ticks)`:
+
+- A tick is *hot* when at least `min_affected_series` distinct series are
+  anomalous in it.
+- Consecutive means one expected interval apart, not adjacent in the data.
+  `tick_interval_seconds` is the telemetry cadence. It defaults to the
+  simulator's `DEFAULT_TICK_INTERVAL_SECONDS`, 60 s. A missing tick breaks the
+  streak, so a gap starts a new count rather than being bridged. The check
+  looks only at the previous tick, so the rule stays causal.
+- A tick without a hot verdict breaks the streak. This includes a tick whose
+  predictions are all unscored, because an unscored tick gives no evidence that
+  a series is hot.
+- An alert fires at each tick that extends a run of hot ticks to
+  `min_consecutive_ticks` or more.
+- `ANY_POSITIVE_RULE`, which is one series for one tick, is the original policy.
+  Gaps and unscored ticks do not change its alerts.
+
+The rule reads `Prediction` objects only: timestamp, series, and decision. It
+cannot see a label. An alert at tick `t` depends only on ticks up to `t`, and a
+test checks this by comparing truncated runs with the full run. A test also
+checks that flipping labels leaves predictions and alerts unchanged.
+
+The rule is passed to `evaluate_window_level` and `run_experiment`, both with the
+any-positive default. The fitted model and the metric-level and effect-level
+results do not depend on the rule. A test checks this.
+
+**Detection delay.** The formula is unchanged. Delay is the first alert inside
+the labelled window minus the window start. Alerts before the window do not
+count for detection. The window bounds come from labels, and they select which
+alerts are scored. They do not change when an alert fires. An alert time is the
+tick where the rule fires, which uses only that tick and earlier ticks. The
+window is taken from every labelled event in the run, scored or not, so an
+unscored onset still anchors the delay. Alerts before onset are counted per run
+as `pre_incident_alert_count` and reported separately. They never detect a
+window.
+
+**Calibration protocol.** No threshold or rule was tuned on the exploratory or
+final runs.
+
+| Split | Seeds | Runs | Use |
+|-------|-------|-----:|-----|
+| Training | 101–104 | 4 normal | Fit each detector. Before the cutoff. |
+| Validation | 301–310 | 50 (10 normal, 40 fault) | Choose one rule per detector, then the preferred detector. |
+| Exploratory (retired) | 201–203 | 15 (3 normal, 12 fault) | Viewed before the staging in 12.11. Not used for any decision. |
+| Final | 401–420 | 100 (20 normal, 80 fault) | Score the frozen configurations once (section 12.11). |
+
+The candidate grid is `min_affected_series` in {1, 2, 3} and
+`min_consecutive_ticks` in {1, 2, 3, 5}. The selection rule was fixed before the
+run. Among rules whose validation run-level false-positive rate is at most 0.10,
+the rule with the highest validation window F1 is chosen. Ties go to the lower
+false-positive rate, then to fewer consecutive ticks, then to fewer series.
+`select_incident_rule` takes validation reports only. If no rule meets the cap,
+it raises an error rather than relaxing the cap.
+
+On validation, the any-positive policy alerted on all 10 normal runs for every
+detector. The chosen rules alerted on none of them. The validation F1 of the
+chosen rule was 1.000 for each detector.
+
+| Detector | Chosen rule (validation) | Validation delay s |
+|----------|--------------------------|-------------------:|
+| z-score, two-sided | series ≥ 3, ticks ≥ 1 | 9.0 |
+| z-score, upper-tail | series ≥ 3, ticks ≥ 1 | 9.0 |
+| robust, two-sided | series ≥ 3, ticks ≥ 2 | 94.5 |
+| robust, upper-tail | series ≥ 3, ticks ≥ 2 | 94.5 |
+
+**Exploratory results, run level (seeds 201–203, retired).** These were viewed
+before the staging in 12.11. They are not evidence for any choice. Each row is
+one run-level decision: 12 fault runs and 3 normal runs.
+
+| Detector | Policy | TP | FP | TN | FN | Precision | Recall | F1 | FPR | Delay s |
+|----------|--------|---:|---:|---:|---:|----------:|-------:|---:|----:|--------:|
+| z-score, two-sided | any-positive | 12 | 3 | 0 | 0 | 0.800 | 1.000 | 0.889 | 1.000 | 0.0 |
+| z-score, two-sided | series ≥ 3, ticks ≥ 1 | 12 | 0 | 3 | 0 | 1.000 | 1.000 | 1.000 | 0.000 | 5.0 |
+| z-score, upper-tail | any-positive | 12 | 3 | 0 | 0 | 0.800 | 1.000 | 0.889 | 1.000 | 0.0 |
+| z-score, upper-tail | series ≥ 3, ticks ≥ 1 | 12 | 0 | 3 | 0 | 1.000 | 1.000 | 1.000 | 0.000 | 5.0 |
+| robust, two-sided | any-positive | 12 | 3 | 0 | 0 | 0.800 | 1.000 | 0.889 | 1.000 | 0.0 |
+| robust, two-sided | series ≥ 3, ticks ≥ 2 | 12 | 0 | 3 | 0 | 1.000 | 1.000 | 1.000 | 0.000 | 125.0 |
+| robust, upper-tail | any-positive | 12 | 3 | 0 | 0 | 0.800 | 1.000 | 0.889 | 1.000 | 0.0 |
+| robust, upper-tail | series ≥ 3, ticks ≥ 2 | 12 | 0 | 3 | 0 | 1.000 | 1.000 | 1.000 | 0.000 | 125.0 |
+
+**Exploratory results, event level.** The rule does not change event-level results, so
+each detector's labelled and affected rows are the same under both policies.
+
+| Detector | Level | TP | FP | TN | FN | Precision | Recall | F1 | FPR |
+|----------|-------|---:|---:|---:|---:|----------:|-------:|---:|----:|
+| z-score, two-sided | labelled | 880 | 63 | 5877 | 1280 | 0.933 | 0.407 | 0.567 | 0.011 |
+| z-score, two-sided | affected | 863 | 80 | 7000 | 157 | 0.915 | 0.846 | 0.879 | 0.011 |
+| z-score, upper-tail | labelled | 820 | 62 | 5878 | 1340 | 0.930 | 0.380 | 0.539 | 0.010 |
+| z-score, upper-tail | affected | 803 | 79 | 7001 | 217 | 0.910 | 0.787 | 0.844 | 0.011 |
+| robust, two-sided | labelled | 927 | 288 | 5652 | 1233 | 0.763 | 0.429 | 0.549 | 0.048 |
+| robust, two-sided | affected | 865 | 350 | 6730 | 155 | 0.712 | 0.848 | 0.774 | 0.049 |
+| robust, upper-tail | labelled | 867 | 288 | 5652 | 1293 | 0.751 | 0.401 | 0.523 | 0.048 |
+| robust, upper-tail | affected | 805 | 350 | 6730 | 215 | 0.697 | 0.789 | 0.740 | 0.049 |
+
+What the numbers show:
+
+- **The run-level false-positive rate falls from 1.000 to 0.000 on test.** The
+  test set has only three normal runs, so this is zero of three, not a rate
+  estimate. The validation set gives the stronger evidence: zero of ten normal
+  runs alerted under the chosen rule, against ten of ten under the original
+  policy.
+- **Event-level false positives are unchanged.** The rule acts on runs, not on
+  events. About 1% of healthy events still fire, and count metrics still produce
+  them. This matters for any operator who sees per-event alerts.
+- **Persistence costs detection latency.** The any-positive delay of 0 s means
+  the first alarm came in the first tick of the fault. The chosen rules must wait
+  for persistence, so the mean delay over the twelve detected windows is 5 s for
+  the z-score detector and 125 s for the robust detector.
+- **Affected recall is higher than labelled recall.** Against the labels, the
+  z-score detector's recall is 0.407. Restricted to series the fault changes, it
+  is 0.846. The gap is the labels marking unaffected metrics anomalous, not
+  missed detections.
+
+**Known gaps in this layer.**
+
+- Validation and test use the same simulator. They show behaviour on the
+  simulator's stationary data with step faults, not on production telemetry.
+- Pre-window alerts in fault runs are counted per run in `pre_incident_alert_count`
+  and reported in section 12.11. They are not detections.
+- Only the first alert of each run is scored. The number of alerts per run, which
+  an operator would see as an alert storm, is not reported.
+- A streak can begin before the fault window and continue into it. The in-window
+  delay would then understate the true delay from fault onset. No exploratory
+  detection had delay 0, so this did not occur there. It has not been measured
+  on the final runs.
+- The affected-series table is written by hand from the simulator's fault
+  effects. A one-off check over six seeds of 240 ticks found that every listed
+  series moved its in-window mean by at least 2.5 pooled standard deviations, and
+  every unlisted series by under 0.1. No test enforces this, so a simulator change
+  could leave the table stale.
+- The grid and the selection cap were chosen by the author. Other choices could
+  select a different rule.
+
+### 12.10 Assumptions and limitations
+
+- **Stationarity.** Each series is assumed to have one stable distribution over
+  training and evaluation. Seasonality and drift break this, and the simulator
+  has neither.
+- **Independence.** Points are scored one at a time. Neighbouring ticks are
+  correlated in real systems, which a point detector ignores.
+- **Distribution shape.** The z-score assumes roughly symmetric, light-tailed
+  data. Counts are discrete and skewed; latencies are right-skewed. The robust
+  detector is less sensitive to tails but still assumes a unimodal core.
+- **Small samples.** The default minimum of 10 training values is a floor, not
+  an estimate of adequacy. Confidence in the mean, stdev, median, and MAD is low
+  for small samples.
+- **Labels.** Window labels mark every metric in the fault window. Metric-level
+  truth is therefore a scenario-window label, not a per-metric effect.
+  Metric-level precision and recall measure agreement with that label.
+- **Simulator scope.** The results describe synthetic, stationary data with step
+  faults. They do not show performance on production telemetry.
+- **Scale.** Scoring is linear in events, with per-series lookup. Fitting is
+  linear in training events. Both run in memory, bounded by the 50,000-event
+  store (section 10).
+
+### 12.11 Model selection and final evaluation
+
+**Selection, validation only.** The two upper-tail detectors are the candidates.
+The upper-tail direction was fixed before this step: a drop in latency or error
+counts is not an incident (`Direction`). Each candidate uses the incident rule
+chosen for it on validation. `select_detector` ranks candidates by validation
+window F1, then by mean validation detection delay. Test and final results are
+not an input.
+
+| Detector | Validation rule | Validation F1 | Validation delay s |
+|----------|-----------------|--------------:|-------------------:|
+| z-score, upper-tail | series ≥ 3, ticks ≥ 1 | 1.000 | 9.0 |
+| robust, upper-tail | series ≥ 3, ticks ≥ 2 | 1.000 | 94.5 |
+
+The z-score upper-tail is preferred. Validation F1 is tied, and its delay is
+shorter. The robust upper-tail is kept as a comparison model. The two-sided
+z-score also reaches validation F1 1.000 at 9.0 s under the same rule. It was
+not a candidate, because the direction was fixed above.
+
+The gap rule in 12.9 did not change any validation number. The simulator emits
+every metric on every tick, so the rule's gap check is exercised only by unit
+tests.
+
+**Frozen configuration.** Nothing below was changed after the final run.
+
+- Preferred: `ZScoreDetector`, threshold 3.0, upper-tail, rule series ≥ 3 and
+  ticks ≥ 1.
+- Comparison: `RobustDetector`, threshold 3.5, upper-tail, rule series ≥ 3 and
+  ticks ≥ 2.
+- Baseline: the any-positive rule, for both detectors.
+- Training: seeds 101–104, fault-free, before the cutoff. Final: seeds 401–420,
+  one normal and four fault runs per seed, 100 runs, 54,000 held-out events.
+
+**Final results, run level, seeds 401–420 (scored once).** Each row is one
+run-level decision: 80 fault runs and 20 normal runs.
+
+| Detector (rule) | TP | FP | TN | FN | Precision | Recall | F1 | FPR | Mean delay s | Pre-incident alerts | Missed incidents |
+|-----------------|---:|---:|---:|---:|----------:|-------:|---:|----:|-------------:|--------------------:|-----------------:|
+| z-score upper-tail (series ≥ 3, ticks ≥ 1) | 80 | 0 | 20 | 0 | 1.000 | 1.000 | 1.000 | 0.000 | 11.2 | 0 runs | 0 of 80 |
+| robust upper-tail (series ≥ 3, ticks ≥ 2) | 80 | 0 | 20 | 0 | 1.000 | 1.000 | 1.000 | 0.000 | 126.8 | 0 runs | 0 of 80 |
+| any-positive baseline (z-score) | 80 | 20 | 0 | 0 | 0.800 | 1.000 | 0.889 | 1.000 | 0.0 | not reported | 0 of 80 |
+| any-positive baseline (robust) | 80 | 20 | 0 | 0 | 0.800 | 1.000 | 0.889 | 1.000 | 0.0 | not reported | 0 of 80 |
+
+Delays are whole multiples of the 60 s tick. The z-score mean of 11.25 s is 15
+ticks over 80 detections, so at most 15 windows had any delay and at least 65
+were detected at onset. The robust rule needs two hot ticks, so every
+detection there has delay of at least 60 s.
+
+Event level, final runs (for context; the rule does not affect it):
+
+| Detector | Level | TP | FP | TN | FN | Precision | Recall | F1 | FPR |
+|----------|-------|---:|---:|---:|---:|----------:|-------:|---:|----:|
+| z-score upper-tail | labelled | 5456 | 435 | 39165 | 8944 | 0.926 | 0.379 | 0.538 | 0.011 |
+| z-score upper-tail | affected | 5358 | 533 | 46667 | 1442 | 0.910 | 0.788 | 0.844 | 0.011 |
+| robust upper-tail | labelled | 5759 | 1984 | 37616 | 8641 | 0.744 | 0.400 | 0.520 | 0.050 |
+| robust upper-tail | affected | 5372 | 2371 | 44829 | 1428 | 0.694 | 0.790 | 0.739 | 0.050 |
+
+**What these results can and cannot support.**
+
+- Zero false positives in 20 normal runs leaves room for a real run-level FPR of
+  up to about 14% at 95% confidence. Zero misses in 80 fault runs leaves room
+  for a miss rate of up to about 4%.
+- Every fault in the simulator is a large, step change. Perfect run-level scores
+  are expected from that design. They say little about subtle faults.
+- The run-level result is strong, but the event-level results are not. The
+  z-score detector still raises about 1% false positives per event, and the
+  robust detector about 5%. The incident rule only suppresses run-level alarms.
+- The final seeds come from the same simulator as validation. They are a check
+  of repeatability, not of transfer to production telemetry.
+
+**Limitations.**
+
+- The selected rule grid and the 10% run-level cap were chosen by the author
+  before validation. Other choices could select a different rule.
+- The gap rule has no effect on any reported number, because the simulator does
+  not drop ticks. Its behaviour is covered only by unit tests.
+- The training model is fitted once on four normal runs and never updated.
