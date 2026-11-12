@@ -155,7 +155,7 @@ class SimulationRun(BaseModel):
         return sum(1 for event in self.events if event.label.is_anomalous)
 
 
-def _run_id(spec: SimulationSpec) -> str:
+def run_id_for(spec: SimulationSpec) -> str:
     """Derive a stable run ID from the spec so identical requests share an ID."""
     digest = hashlib.sha256(spec.model_dump_json().encode()).hexdigest()
     return f"sim-{digest[:16]}"
@@ -254,7 +254,7 @@ EVENTS_PER_TICK = sum(len(metrics) for _, metrics in _SERVICE_METRICS)
 
 def run_simulation(spec: SimulationSpec) -> SimulationRun:
     """Generate every event for a spec. Pure: one spec always yields one run."""
-    run_id = _run_id(spec)
+    run_id = run_id_for(spec)
     rng = random.Random(spec.seed)
     fault_ticks = (
         _fault_ticks(spec.ticks)

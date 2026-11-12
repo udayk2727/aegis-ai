@@ -117,3 +117,16 @@ def test_query_past_the_end_returns_empty_page_with_total() -> None:
 
     assert page == []
     assert total == len(run.events)
+
+
+def test_runs_snapshot_is_oldest_first_and_unaffected_by_later_writes() -> None:
+    store = EventStore(max_events=1000)
+    first = _run(ScenarioId.NORMAL_OPERATION, seed=1)
+    second = _run(ScenarioId.CPU_SATURATION, seed=2)
+    store.add_run(first)
+
+    snapshot = store.runs()
+    store.add_run(second)
+
+    assert [run.run_id for run in snapshot] == [first.run_id]
+    assert [run.run_id for run in store.runs()] == [first.run_id, second.run_id]

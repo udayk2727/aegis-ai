@@ -3,9 +3,10 @@
 **Status:** Draft. Describes the target architecture. Today the backend has the
 foundation (`GET /`, `GET /health`), an in-memory simulation engine with
 `POST /api/v1/simulations` and `GET /api/v1/events` (section 10), read-only
-analytics and baselines (section 11), and offline statistical anomaly detection
-in the Python library (section 12). Everything else below is planned and will be
-refined as each phase is implemented.
+analytics and baselines (section 11), offline statistical anomaly detection
+in the Python library (section 12), and offline incident correlation with
+read-only `GET /api/v1/incidents` endpoints (section 13). Everything else below
+is planned and will be refined as each phase is implemented.
 
 ## 1. Purpose
 
@@ -72,7 +73,7 @@ intended to:
 | Simulation engine      | Synthetic labelled telemetry for testing detection      | Started |
 | Statistical detection  | Z-score and robust detectors, held-out evaluation       | Started (library, offline) |
 | Ingestion              | Accept and normalize alerts, logs, and metrics          | Planned |
-| Correlation engine     | Group related signals into incidents                    | Planned |
+| Correlation engine     | Group related signals into incidents                    | Started (offline, read-only API) |
 | Investigation agents   | Gather context and propose root-cause hypotheses        | Planned |
 | Approval gate          | Hold recommended actions until a human approves         | Planned |
 | Action executor        | Perform approved remediation through audited adapters   | Planned |
@@ -88,7 +89,8 @@ backend/
 │   ├── __init__.py        version constant
 │   ├── main.py            application factory (composition root)
 │   ├── domain/            telemetry models: no I/O, no framework imports
-│   ├── services/          simulation engine and in-memory event store
+│   ├── services/          simulation, event store, analytics, detection, correlation,
+│   │                      trusted baselines and offline validation
 │   └── routers/           HTTP layer, one module per feature area
 └── tests/                 pytest suite using the TestClient fixture
 ```
@@ -172,7 +174,7 @@ retrieval shape the database adapter will need, not a persistence design.
 |-------|-----------------------------------------------|-------------|
 | 0     | Project foundation, health endpoint, tests    | In progress |
 | 1     | Configuration, logging, and domain models     | Partial: telemetry models, simulation engine (section 10), analytics (section 11), detectors (section 12) |
-| 2     | Signal ingestion and incident correlation     | Planned     |
+| 2     | Signal ingestion and incident correlation     | Partial: correlation and incident API (section 13); ingestion planned |
 | 3     | Authentication and authorization              | Planned     |
 | 4     | Investigation agents with LLM adapter         | Planned     |
 | 5     | Approval workflow and audit log               | Planned     |
@@ -808,3 +810,323 @@ Event level, final runs (for context; the rule does not affect it):
 - The gap rule has no effect on any reported number, because the simulator does
   not drop ticks. Its behaviour is covered only by unit tests.
 - The training model is fitted once on four normal runs and never updated.
+
+## 13. Incident correlation and evidence
+
+Status: **Implemented, read-only, computed on request from the in-memory store.**
+Correlation groups the alerts of one simulation run into incidents, attaches
+the stored observations that support each incident, and builds a timeline. It
+uses the Day 4 incident rule unchanged and makes no root-cause claim.
+
+### 13.1 Components
+
+| Module | Responsibility |
+|--------|----------------|
+| `app/domain/incident_records.py` | Pydantic contracts: `Incident`, `IncidentSummary`, `EvidenceRecord`, `TimelineEntry`, `TelemetryGap`, `CorrelationReason`, `BaselineComparison` |
+| `app/services/topology.py` | Declared service calls: `api-gateway -> orders-service -> orders-db` |
+| `app/services/correlation.py` | Alert construction, the grouping rule, and the correlation rationale |
+| `app/services/evidence.py` | Read-only evidence collection and telemetry gap detection |
+| `app/services/timeline.py` | Deterministic timeline of observations and detection decisions |
+| `app/services/incident_pipeline.py` | Offline pipeline: runs in, incident records out, no I/O |
+| `app/services/baseline_trust.py` | Label-free registry of approved baselines. Required by `build_incidents` (13.12) |
+| `app/services/trusted_baselines.py` | Loads and writes the local manifest, re-verifying every entry (13.12) |
+| `app/services/offline_validation.py` | Label-aware check that a synthetic run has no injected fault. Offline and startup only (13.12) |
+| `app/services/correlation_validation.py` | Label-aware offline scoring of the window against synthetic truth (13.13) |
+| `scripts/approve_baselines.py`, `scripts/evaluate_correlation_window.py` | Offline workflows that write the manifest and print the window sweep (13.12, 13.13) |
+| `app/routers/incidents.py` | Read-only HTTP endpoints; validation and safe errors only |
+
+`app/services/incident.py` (the Day 4 rule) and `app/services/detectors.py` are
+not modified. The pipeline calls `IncidentRule.alert_times` and the detector's
+`predict` as they are.
+
+### 13.2 Pipeline
+
+1. **Baseline.** One detector is fitted on the events of the caller-named
+   baseline runs. Each named run must be on the trusted list (13.12). The
+   pipeline does not read labels, so it does not check that a run is fault-free.
+   The API enforces trust before calling the pipeline. The selected detector is
+   `ZScoreDetector` with upper-tail direction, as in the Day 4 validation.
+2. **Scoring.** Every other stored run is scored against that fitted model.
+   Baseline runs are never scored.
+3. **Alerts.** The selected rule, `IncidentRule(min_affected_series=3,
+   min_consecutive_ticks=1)`, gives the alert ticks of each run. Each alert is
+   the set of series that were anomalous at its tick.
+4. **Grouping.** Within one run, alerts are grouped as described in 13.3.
+5. **Evidence and timeline.** Each group gets evidence (13.4), the telemetry
+   gaps that overlap its span, a timeline (13.5), and a deterministic ID (13.6).
+
+### 13.3 Correlation rules
+
+Two alerts in the same run are linked when both hold:
+
+1. **Temporal proximity.** They are at most `window_seconds` apart, inclusive.
+   The default is 600 seconds (ten one-minute ticks).
+2. **Service relation.** Their services are equal, or one calls the other in the
+   declared topology. `api-gateway` and `orders-db` are not directly related, so
+   alerts on only those two services stay apart even when close in time.
+
+An incident is a connected component of the link graph. Links are transitive, so
+a chain of related alerts can span more than one window. Alerts from different
+runs are never linked.
+
+Determinism: alerts are sorted by time before grouping, and groups are ordered
+by their first alert, so input order does not change the result. A repeated
+prediction for the same tick and series counts once.
+
+### 13.4 Evidence contract
+
+Each `EvidenceRecord` has:
+
+- `source_event_id`, `run_id`, `service`, `metric_name`, `unit`, `severity`,
+  `observed_at`, `observed_value`. These are copied from the stored event that
+  the detector scored, so no value is invented.
+- `inclusion_reason` separates three things, and only the first is a qualifying
+  detection:
+  - `contributed_to_alert`: the observation's tick was an alert tick. This is a
+    qualifying detection.
+  - `anomalous_in_window`: an anomalous measurement after the first qualifying
+    detection that did not qualify an alert.
+  - `pre_incident_context`: an anomalous sample before the first qualifying
+    detection. It is context only, often noise, and not evidence that the
+    incident was already under way or of its cause.
+- `baseline_comparison`: detector, direction, threshold, score, and the baseline
+  run IDs. It is `null` for a zero-spread deviation, which has no finite score.
+
+The span of an incident is `[first alert - window, last alert + window]`. Its
+evidence is the anomalous observations of the series that took part in its
+alerts, sorted by observation time and then by series.
+
+Only `contributed_to_alert` records show degradation. They set
+`first_observation_at`, `latest_observation_at`, and the timeline. An
+`anomalous_in_window` record is context. It can precede onset or follow the last
+alert, so it stays in `evidence` but is never reported as supporting evidence.
+
+### 13.5 Timeline
+
+Each `TimelineEntry` has a `kind` that separates measurements from decisions:
+
+| Kind | Meaning | Milestones |
+|------|---------|------------|
+| `observation` | A stored telemetry sample taken at an alert tick (context samples are excluded) | earliest supporting observation; related metric change (first alert-tick sample per series); latest observed evidence |
+| `detection_decision` | The rule fired at a tick, using data up to and including that tick | first qualifying detection |
+| `telemetry_gap` | No observation between two stored timestamps | telemetry gap |
+
+### 13.6 Identity and status
+
+- `incident_id` is `inc-` followed by 16 hex digits. It is a SHA-256 hash of the
+  source run, detector, rule, baseline run IDs, first alert time, and series.
+  The same inputs always give the same ID.
+- `status` is `detected` for every incident. It means the rule fired. It says
+  nothing about triage, resolution, or cause.
+- `root_cause_assessment` is `not_assessed` for every incident. No field holds a
+  root cause, and the validator rejects any other value.
+
+### 13.7 Timestamp semantics
+
+| Field | Meaning |
+|-------|---------|
+| `first_observation_at` | Time of the earliest alert-contributing sample. Alert-contributing samples sit at alert ticks, so this equals the first alert tick |
+| `first_detection_at` | Tick at which the rule first fired (a decision) |
+| `latest_detection_at` | Tick of the last alert in the group (a decision) |
+| `latest_observation_at` | Time of the latest supporting sample |
+
+The model requires `first_observation_at <= first_detection_at <=
+latest_detection_at <= latest_observation_at`. The simulator has no alert
+delay, so a decision is stamped at the tick whose data it used.
+
+### 13.8 Endpoints
+
+| Method and path | Purpose |
+|-----------------|---------|
+| `GET /api/v1/incidents` | Page of incident summaries, ordered by first detection, then ID |
+| `GET /api/v1/incidents/{incident_id}` | One incident with evidence, timeline, and gaps |
+
+Both endpoints require `baseline_run_id` (1 to 8, repeatable). On the list,
+`limit` is 1 to 200 with a default of 50, `offset` is at least 0, and `run_id`
+keeps only one run's incidents. The detail response is not paginated. Its
+evidence holds at most one record per series per tick, so it is bounded by the
+run: 288 ticks times 9 series at most. Each request recomputes every incident
+from the store, which takes about 0.5 s at the 50,000-event capacity.
+
+Errors have a fixed `code` and no internal detail:
+
+| Status | Code | Meaning |
+|-------:|------|---------|
+| 403 | `baseline_not_approved` | A named baseline is not on the trusted list. Checked before the store |
+| 404 | `baseline_run_not_found` | An approved baseline is not in the event store |
+| 404 | `incident_not_found` | No incident with that ID for the given baselines |
+
+Responses never include stack traces or internal paths. Requests cannot approve
+or change baselines. The trusted list comes only from the offline manifest (13.12).
+
+### 13.9 Correlation is not causation
+
+Correlation here records co-occurrence in time and in a declared dependency
+graph. It does not establish that one service caused another. Every incident
+carries a `not_causal` rationale item that says so, and `root_cause_assessment`
+stays `not_assessed`. A future investigation step must add its own evidence
+before any cause is stated.
+
+### 13.10 Limitations
+
+- **Synthetic telemetry.** Every fault is a large, step-shaped change, so the
+  correlation rules are tested on easy cases. The simulator has no seasonality,
+  no ramps, and no partial outages.
+- **Window chosen after inspection.** The 600-second default was picked after
+  looking at simulator runs with seeds 201 to 205. It is retained. It was not
+  retuned on held-out results. Section 13.13 gives the synthetic sweep, the
+  error types, and the risk of false merges and false splits.
+- **Context evidence.** The evidence list can start before onset and end after
+  the last alert. On seeds 501 to 520, 35 of 80 fault incidents had
+  `pre_incident_context` samples. Most were `http_error_count` and
+  `db_connection_failures`, both Poisson error counts with a near-zero baseline.
+  Context never sets observation times or the timeline. The detector's flagging
+  of single low counts is a detector limitation, not a correlation one.
+- **Chaining.** Transitive links can join two faults a few windows apart if
+  alerts keep appearing in between.
+- **Baseline trust.** A fault-containing baseline would teach the detector that
+  the fault is normal. The API now accepts only approved baselines (13.12). The
+  pipeline still does not check labels, so a direct caller of `build_incidents`
+  can pass any run. The production trust source is undecided.
+- **No persistence.** Incidents are recomputed on every request from the
+  in-memory store. A restart empties the store and removes the incidents. Each
+  request also rescans all stored runs. This is acceptable at the 50,000-event
+  capacity; an index belongs with the database adapter.
+- **Unauthenticated read.** The endpoints are read-only, but they share the
+  development-only exposure of the simulation endpoints. They expose simulated
+  data only.
+- **Telemetry gaps** are covered by unit tests only. The simulator never drops
+  ticks. Gaps are detected per run and per tick. A single series missing at one
+  tick, while the rest of that tick arrives, is not reported as a gap.
+- **Duplicate events.** A run that repeats an event ID is refused with
+  `ValueError`. The API cannot ingest events, so this only applies to direct
+  callers of the pipeline.
+
+### 13.11 Planned consumption by AI agents (not implemented)
+
+Investigation agents will read an incident's evidence and timeline. Each
+`source_event_id` lets an agent cite the exact observation it relies on, and
+each `correlation_rationale` item states what the grouping does and does not
+show. Agent output stays untrusted under section 5: any claimed cause must be
+checked against the cited evidence before it is shown as a finding.
+
+### 13.12 Trusted baselines
+
+**Problem.** The pipeline fits its detector on whatever baseline runs a request
+names. A fault-containing baseline would teach the detector that the fault is
+normal, and nothing would report it.
+
+**Decision (owner, Option A).** Only explicitly approved baseline runs may be used.
+Approval is offline, from ground-truth labels, and it is recorded with its
+provenance. Requests cannot approve or change a baseline.
+
+**Components.**
+
+- `offline_validation.py` holds the label-aware check. `validate_synthetic_baseline`
+  rejects a run whose scenario is a fault, or that has any anomalous label. It
+  records the run ID, spec, check method, and event count.
+- `scripts/approve_baselines.py` simulates candidate normal specs, runs the check,
+  and writes a manifest to `local/trusted_baselines.json` by default. If any
+  candidate is faulty, it writes nothing and exits non-zero.
+- `baseline_trust.py` holds the registry, `TrustedBaselines`. It contains no label
+  logic. Its only job is membership: `is_approved(run_id)`. Its default value
+  trusts nothing.
+- `trusted_baselines.py` loads the manifest. `load_trusted_baselines` re-simulates
+  every entry, re-runs the check, and confirms each recorded run ID matches its
+  spec. Any failure refuses the whole file. There is no `trusted=true` flag.
+- `build_incidents` takes `trusted` as a required keyword argument, with no
+  default. It refuses any baseline the registry does not approve, even when the
+  run is stored and well formed. The API therefore cannot reach the pipeline
+  with an unapproved baseline, and neither can a direct caller.
+- `AEGIS_TRUSTED_BASELINES_PATH` names the manifest. Settings refuse it in
+  production. Without it, the registry is empty, so every incident request that
+  names a baseline is refused with `403 baseline_not_approved`.
+- The router checks approval before it reads the store. An approved run that is
+  not stored gives `404 baseline_run_not_found`.
+- Test code uses the same offline check through `trusted_baselines()` in
+  `tests/incident_factories.py`, so tests never build an approval by hand.
+
+**Manifest format (version 1).**
+
+```json
+{
+  "version": 1,
+  "baselines": [
+    {
+      "run_id": "sim-...",
+      "method": "synthetic_ground_truth",
+      "checked_event_count": 2592,
+      "spec": {"scenario": "normal_operation", "seed": 101, "ticks": 288}
+    }
+  ]
+}
+```
+
+The `spec` object also records `start_time` and `tick_interval_seconds`.
+
+**Label boundary.** Label-aware code runs only offline and at startup, when the
+manifest is loaded. No request path reads labels. `test_label_isolation.py` checks
+detection, correlation, the pipeline, and the router. It fails on any label read
+or label import. It also follows the application's own imports, so it fails if
+any of them reaches the offline modules, directly or indirectly.
+
+**Limits.**
+
+- Synthetic validation shows that a run has no injected fault. It does not show
+  that the run is representative of production traffic. The simulator's normal
+  behaviour is stationary.
+- The manifest is for local development. There is no production trust source. A
+  production design needs the authentication design in section 5 and an approval
+  workflow (phase 5 in section 8).
+- The store is in memory. After a restart, the manifest is reloaded, but the
+  baseline runs must be created again from the same specs.
+
+### 13.13 Correlation window and error types
+
+**Status.** The 600-second window is provisional. It was retained for Day 5 and
+was not retuned on held-out results.
+
+**Error types**, scored per window on synthetic runs with known faults
+(`app/services/correlation_validation.py`):
+
+- **Missed fault.** A fault run has no incident that alerts inside its fault window.
+- **False split.** A single fault is cut into more than one incident. Each
+  incident beyond the first that alerts in the fault window counts once.
+- **False merge.** One incident mixes alerts inside the fault window with alerts
+  outside it. Unrelated noise was joined to the fault.
+- **False incident.** An incident has no alert inside the fault window. Every
+  incident in a normal run is one.
+
+**Synthetic result.** Baselines are seeds 101 to 104, normal runs at 60 ticks.
+Evaluation is seeds 501 to 520 (80 fault runs and 20 normal runs). Seeds 201 to
+205 were used to choose the default. Seeds 401 to 420 are the held-out set, and
+this sweep does not use them.
+
+| Window (s) | Missed | Splits | Merges | False incidents | Incidents |
+|-----------:|-------:|-------:|-------:|----------------:|----------:|
+| 60 | 0 | 126 | 0 | 0 | 206 |
+| 300 | 0 | 1 | 0 | 0 | 81 |
+| 600 | 0 | 0 | 0 | 0 | 80 |
+| 900 | 0 | 0 | 0 | 0 | 80 |
+| 1200 | 0 | 0 | 0 | 0 | 80 |
+
+Reproduce with `python scripts/evaluate_correlation_window.py`. The output is
+deterministic.
+
+**What this does and does not show.**
+
+- The window matters most at the short end. A 60-second window splits faults.
+  The 300 to 1200 second range gave the same result here, so the simulator does
+  not separate 600 seconds from its neighbours.
+- **False merging is possible in production.** A window that is too long can join
+  an unrelated alert to a real fault, and transitive links can chain faults that
+  are several windows apart. The simulator cannot show this. It has one fault per
+  run, and the only merge it could produce is noise joining a fault, which did not
+  happen here.
+- **False splitting is possible in production.** When a rule stops firing for
+  longer than the window, one fault becomes two incidents. Real telemetry with
+  gaps, drift, or intermittent alerts is more likely to show this than the
+  simulator.
+- The result is conditional on the simulator. Its faults are large step changes,
+  and its normal behaviour is stationary. Check the window again on real
+  telemetry, with held-out runs chosen before the check.

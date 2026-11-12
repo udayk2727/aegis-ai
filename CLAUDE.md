@@ -30,6 +30,7 @@ without explicit approval from the project owner:
 | `frontend/`        | Placeholder for the user interface                   |
 | `infrastructure/`  | Placeholder for deployment assets                    |
 | `docs/`            | Architecture and design documents                    |
+| `scripts/`         | Offline analysis and approval workflows              |
 
 ## Language and runtime
 

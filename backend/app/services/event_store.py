@@ -109,6 +109,15 @@ class EventStore:
                 if event_filter.matches(event)
             ]
 
+    def runs(self) -> list[SimulationRun]:
+        """Return a snapshot of the stored runs, oldest first.
+
+        The list is a copy, so a caller can iterate it while other requests add
+        or evict runs. Runs are immutable, so the snapshot cannot change under it.
+        """
+        with self._lock:
+            return list(self._runs.values())
+
     def query(
         self,
         event_filter: EventFilter,

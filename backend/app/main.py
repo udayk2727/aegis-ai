@@ -14,13 +14,16 @@ from fastapi import FastAPI
 
 from app import __version__
 from app.config import Settings, load_settings
-from app.routers import analytics, events, simulations, system
+from app.routers import analytics, events, incidents, simulations, system
 from app.services.event_store import DEFAULT_EVENT_CAPACITY, EventStore
+from app.services.baseline_trust import TrustedBaselines
+from app.services.trusted_baselines import load_trusted_baselines
 
 
 def create_app(
     settings: Settings | None = None,
     event_capacity: int = DEFAULT_EVENT_CAPACITY,
+    trusted_baselines: TrustedBaselines | None = None,
 ) -> FastAPI:
     """Build and configure the FastAPI application.
 
@@ -28,20 +31,32 @@ def create_app(
     feature area can be developed and tested in isolation. Shared state is
     created per application so tests never see each other's data. The
     simulation router is registered only when the settings allow it.
+
+    Trusted baselines come from ``trusted_baselines`` when given, otherwise from
+    the manifest named in the settings, otherwise none. With none, every incident
+    request that names a baseline is refused.
     """
     if settings is None:
         settings = load_settings(os.environ)
+    if trusted_baselines is None:
+        trusted_baselines = (
+            load_trusted_baselines(settings.trusted_baselines_path)
+            if settings.trusted_baselines_path is not None
+            else TrustedBaselines()
+        )
     application = FastAPI(
         title="AEGIS AI",
         description="Autonomous Enterprise Incident Intelligence Platform",
         version=__version__,
     )
     application.state.event_store = EventStore(max_events=event_capacity)
+    application.state.trusted_baselines = trusted_baselines
     application.include_router(system.router)
     if settings.simulation_api_enabled:
         application.include_router(simulations.router)
     application.include_router(events.router)
     application.include_router(analytics.router)
+    application.include_router(incidents.router)
     return application
 
 

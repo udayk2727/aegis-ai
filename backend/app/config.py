@@ -12,12 +12,14 @@ requires the authentication design in docs/architecture.md, not a config change.
 
 from collections.abc import Mapping
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 ENVIRONMENT_VARIABLE = "AEGIS_ENVIRONMENT"
 SIMULATION_API_VARIABLE = "AEGIS_SIMULATION_API_ENABLED"
+TRUSTED_BASELINES_VARIABLE = "AEGIS_TRUSTED_BASELINES_PATH"
 
 
 class Environment(StrEnum):
@@ -38,14 +40,22 @@ class Settings(BaseModel):
 
     environment: Environment = Environment.PRODUCTION
     simulation_api_enabled: bool = False
+    trusted_baselines_path: Path | None = None
 
     @model_validator(mode="after")
-    def _simulation_api_is_development_only(self) -> Self:
-        """Refuse to enable the unauthenticated simulation endpoint in production."""
-        if self.simulation_api_enabled and self.environment is Environment.PRODUCTION:
+    def _development_only_features(self) -> Self:
+        """Refuse development-only features when the environment is production."""
+        if self.environment is not Environment.PRODUCTION:
+            return self
+        if self.simulation_api_enabled:
             raise ValueError(
                 "the simulation API has no authentication and is development-only; "
                 "it cannot be enabled when the environment is production"
+            )
+        if self.trusted_baselines_path is not None:
+            raise ValueError(
+                "trusted baselines from a local manifest are development-only; "
+                "they cannot be loaded when the environment is production"
             )
         return self
 
@@ -57,6 +67,8 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         raw["environment"] = environ[ENVIRONMENT_VARIABLE]
     if SIMULATION_API_VARIABLE in environ:
         raw["simulation_api_enabled"] = environ[SIMULATION_API_VARIABLE]
+    if TRUSTED_BASELINES_VARIABLE in environ:
+        raw["trusted_baselines_path"] = environ[TRUSTED_BASELINES_VARIABLE]
     try:
         return Settings.model_validate(raw)
     except ValidationError as error:

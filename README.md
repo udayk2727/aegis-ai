@@ -10,8 +10,9 @@ approved actions under human supervision and with a full audit trail.
 > **Status:** Foundation stage. The repository provides a FastAPI backend with
 > service and health endpoints, an enterprise incident simulation engine that
 > generates labelled synthetic telemetry in memory, a pytest suite, and
-> placeholders for the frontend and infrastructure. Correlation, investigation,
-> and remediation are planned.
+> placeholders for the frontend and infrastructure. Offline incident correlation
+> over simulated data is implemented; investigation, approval, and remediation
+> are planned.
 
 ## Features
 
@@ -30,11 +31,14 @@ Available now:
   [Running visualizations](#running-visualizations))
 - Statistical anomaly detectors (z-score and robust) as a Python library, with
   held-out evaluation (see [Anomaly detection](#anomaly-detection))
+- `GET /api/v1/incidents` and `GET /api/v1/incidents/{incident_id}`: read-only
+  incidents correlated from detection alerts, with evidence and a timeline
+  (see [Incident correlation](#incident-correlation))
 - Automated tests with pytest
 
 Planned (see [docs/architecture.md](docs/architecture.md)):
 
-- Signal ingestion and incident correlation
+- Signal ingestion from external systems (the correlation runs on simulated data)
 - Investigation agents backed by an LLM adapter
 - Human approval workflow and audit log
 - Controlled remediation execution
@@ -62,6 +66,7 @@ aegis-ai/
 │   │   └── services/     Simulation engine, event store, analytics, and detectors
 │   └── tests/        pytest suite
 ├── scripts/          Offline analysis scripts (charts, detector evaluation)
+├── local/            Git-ignored local manifests (trusted baselines)
 ├── frontend/         Placeholder for the user interface
 ├── infrastructure/   Placeholder for deployment assets
 ├── docs/             Architecture documentation
@@ -589,6 +594,299 @@ gives the frozen final results.
 - The zero-spread policy and the default thresholds were chosen before the
   held-out evaluation and were not tuned on it.
 
+## Incident correlation
+
+The correlation layer groups detection alerts into incidents, attaches the
+stored observations that support them, and builds a timeline. It is an offline
+pipeline (`backend/app/services/incident_pipeline.py`) behind two read-only
+endpoints. It uses the Day 4 incident rule and detector without changes.
+
+> **Correlation is not causation.** Each incident records that alerts happened
+> close together on services that call each other. It does not say which
+> service caused the others. `root_cause_assessment` is always `not_assessed`.
+
+### Correlation rules
+
+Two alerts in the same run are linked when both hold:
+
+1. they are at most 600 seconds apart (inclusive), and
+2. their services are equal, or one calls the other in the declared topology
+   (`api-gateway -> orders-service -> orders-db`).
+
+An incident is a group of alerts linked directly or through a chain of related
+alerts. Runs are never merged. The 600-second default is a tuned value, not a
+validated one (see the limitations in
+[docs/architecture.md](docs/architecture.md#1310-limitations)).
+
+### Baselines
+
+Every request names the normal runs the detector learns from with
+`baseline_run_id` (one to eight, repeatable). A baseline is accepted only if it
+was approved offline. No request can approve, add, or change a baseline. An
+unapproved run is refused with `403` and the code `baseline_not_approved`, before
+the store is consulted.
+
+Approval is a local development workflow:
+
+```powershell
+# 1. Approve candidate normal runs offline. A candidate with any injected fault
+#    stops the script, and no manifest is written.
+python scripts/approve_baselines.py --seeds 101 102 103 104 --ticks 288
+
+# 2. Start the API with the manifest. It re-simulates and re-checks every entry
+#    on load, and refuses the whole file if any entry fails.
+$env:AEGIS_TRUSTED_BASELINES_PATH = "local/trusted_baselines.json"
+python -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --reload
+
+# 3. Create each approved run with POST /api/v1/simulations, using the same
+#    scenario, seed, ticks, and cadence. The run ID is derived from the spec, so
+#    it matches the manifest. Then pass it as baseline_run_id.
+```
+
+The synthetic check uses ground-truth labels, offline. It proves only that a
+synthetic baseline contains no injected fault. It does not prove that the run is
+representative of production traffic (see
+[docs/architecture.md](docs/architecture.md#1312-trusted-baselines)). The
+manifest is a development feature. Settings refuse it in production, where no
+baseline is trusted, so every incident request is refused.
+
+### Endpoints
+
+```text
+GET /api/v1/incidents?baseline_run_id=<run>[&run_id=<run>][&limit=50][&offset=0]
+GET /api/v1/incidents/{incident_id}?baseline_run_id=<run>
+```
+
+The list returns summaries, ordered by first detection and then by ID. The
+detail returns the full incident with `evidence`, `timeline`, and
+`telemetry_gaps`. Errors have a fixed `code` and no internal detail:
+
+| Status | Code | Meaning |
+|-------:|------|---------|
+| 403 | `baseline_not_approved` | A named baseline is not on the trusted list |
+| 404 | `baseline_run_not_found` | An approved baseline is not in the event store |
+| 404 | `incident_not_found` | No incident with that ID for the given baselines |
+
+A sample detail response, from the API with two approved baselines and a
+`cpu_saturation` run, trimmed to three of 293 evidence records (one per
+inclusion reason) and two of the timeline entries:
+
+```json
+{
+  "incident_id": "inc-b5cb080ba8a5c34d",
+  "status": "detected",
+  "root_cause_assessment": "not_assessed",
+  "source_run_id": "sim-c8ffd0c14e1c496c",
+  "baseline_run_ids": [
+    "sim-29689797753d5dc4",
+    "sim-adc625dd6a5e7fe5"
+  ],
+  "detector": "zscore",
+  "rule": "series>=3 ticks>=1",
+  "correlation_window_seconds": 600,
+  "first_observation_at": "2026-01-01T01:36:00Z",
+  "first_detection_at": "2026-01-01T01:36:00Z",
+  "latest_detection_at": "2026-01-01T03:11:00Z",
+  "latest_observation_at": "2026-01-01T03:11:00Z",
+  "alert_count": 96,
+  "affected_services": [
+    "api-gateway",
+    "orders-service"
+  ],
+  "affected_metrics": [
+    "cpu_utilization_percent",
+    "db_connection_failures",
+    "http_error_count",
+    "request_latency_ms"
+  ],
+  "correlation_rationale": [
+    {
+      "kind": "temporal_proximity",
+      "detail": "96 alert ticks linked by a chain of related alerts at most 600 seconds apart"
+    },
+    {
+      "kind": "dependency_link",
+      "detail": "api-gateway calls orders-service in the declared topology"
+    },
+    {
+      "kind": "related_metric_behavior",
+      "detail": "5 series anomalous together across 2 service(s); metrics: cpu_utilization_percent, db_connection_failures, http_error_count, request_latency_ms"
+    },
+    {
+      "kind": "not_causal",
+      "detail": "co-occurrence in time and in the declared topology does not establish which service caused the others"
+    }
+  ],
+  "evidence": [
+    {
+      "source_event_id": "sim-c8ffd0c14e1c496c-000778",
+      "run_id": "sim-c8ffd0c14e1c496c",
+      "service": "orders-service",
+      "metric_name": "http_error_count",
+      "unit": "count",
+      "severity": "warning",
+      "observed_at": "2026-01-01T01:26:00Z",
+      "observed_value": 2.0,
+      "inclusion_reason": "pre_incident_context",
+      "baseline_comparison": {
+        "detector": "zscore",
+        "direction": "upper_tail",
+        "threshold": 3.0,
+        "score": 3.798207913758143,
+        "training_run_ids": [
+          "sim-29689797753d5dc4",
+          "sim-adc625dd6a5e7fe5"
+        ]
+      }
+    },
+    {
+      "source_event_id": "sim-c8ffd0c14e1c496c-000865",
+      "run_id": "sim-c8ffd0c14e1c496c",
+      "service": "api-gateway",
+      "metric_name": "request_latency_ms",
+      "unit": "milliseconds",
+      "severity": "info",
+      "observed_at": "2026-01-01T01:36:00Z",
+      "observed_value": 291.563,
+      "inclusion_reason": "contributed_to_alert",
+      "baseline_comparison": {
+        "detector": "zscore",
+        "direction": "upper_tail",
+        "threshold": 3.0,
+        "score": 9.794043816616199,
+        "training_run_ids": [
+          "sim-29689797753d5dc4",
+          "sim-adc625dd6a5e7fe5"
+        ]
+      }
+    },
+    {
+      "source_event_id": "sim-c8ffd0c14e1c496c-001731",
+      "run_id": "sim-c8ffd0c14e1c496c",
+      "service": "orders-service",
+      "metric_name": "request_latency_ms",
+      "unit": "milliseconds",
+      "severity": "info",
+      "observed_at": "2026-01-01T03:12:00Z",
+      "observed_value": 176.993,
+      "inclusion_reason": "anomalous_in_window",
+      "baseline_comparison": {
+        "detector": "zscore",
+        "direction": "upper_tail",
+        "threshold": 3.0,
+        "score": 3.043937015786426,
+        "training_run_ids": [
+          "sim-29689797753d5dc4",
+          "sim-adc625dd6a5e7fe5"
+        ]
+      }
+    }
+  ],
+  "timeline": [
+    {
+      "timestamp": "2026-01-01T01:36:00Z",
+      "kind": "observation",
+      "milestone": "earliest_supporting_observation",
+      "service": "api-gateway",
+      "metric_name": "request_latency_ms",
+      "source_event_id": "sim-c8ffd0c14e1c496c-000865",
+      "description": "api-gateway request_latency_ms observed 291.563 milliseconds (info)"
+    },
+    {
+      "timestamp": "2026-01-01T03:11:00Z",
+      "kind": "observation",
+      "milestone": "latest_observed_evidence",
+      "service": "orders-service",
+      "metric_name": "request_latency_ms",
+      "source_event_id": "sim-c8ffd0c14e1c496c-001722",
+      "description": "orders-service request_latency_ms observed 341.926 milliseconds (info)"
+    }
+  ],
+  "telemetry_gaps": []
+}
+```
+
+The full response includes every evidence record and every timeline entry.
+
+### Evidence and timestamps
+
+- Each evidence record names the stored event it came from (`source_event_id`)
+  and copies that event's value and timestamp. Nothing is invented.
+- Each record has one `inclusion_reason`, and only the first is a qualifying
+  detection:
+  - `contributed_to_alert`: a qualifying detection. The sample was taken at an
+    alert tick.
+  - `anomalous_in_window`: an anomalous measurement after the first detection
+    that did not qualify an alert.
+  - `pre_incident_context`: an anomalous sample before the first detection. It is
+    context only. It is often noise, and it is not proof that the incident was
+    already under way, or of its cause. It never sets observation times or the
+    timeline.
+- `first_observation_at` and `latest_observation_at` are the first and last
+  qualifying samples. They sit at alert ticks, so they equal the first and latest
+  detection times.
+- `*_detection_at` fields are ticks at which the rule decided to alert.
+- A zero-spread deviation has evidence but `baseline_comparison: null`, because
+  it has no finite score.
+
+### Window limits
+
+The 600-second window is provisional. It was chosen on a small set of simulator
+runs and has not been validated on held-out data. On synthetic validation seeds
+it produced no false merges and no false splits, but a shorter window splits
+faults, and a longer window could merge unrelated alerts in production telemetry.
+Reproduce the synthetic sweep with `python scripts/evaluate_correlation_window.py`.
+Details are in [docs/architecture.md](docs/architecture.md#1313-correlation-window-and-error-types).
+
+
+### Verifying the pipeline (Windows PowerShell)
+
+Run the suite from the repository root:
+
+```powershell
+cd C:\Projects\aegis-ai
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+Approve the two normal baseline seeds offline. This writes
+`local/trusted_baselines.json`, which the API reads at startup. A fault run cannot
+be approved, and the script stops if any candidate contains an injected fault:
+
+```powershell
+.\.venv\Scripts\python.exe scriptspprove_baselines.py --seeds 301 302 --ticks 288
+```
+
+Run the API locally with the simulation endpoint enabled, and with the approved
+baselines loaded. Both variables are development-only:
+
+```powershell
+$env:AEGIS_ENVIRONMENT = "development"
+$env:AEGIS_SIMULATION_API_ENABLED = "true"
+$env:AEGIS_TRUSTED_BASELINES_PATH = "local	rusted_baselines.json"
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000
+```
+
+In a second PowerShell window, create the two approved normal baseline runs and
+one fault run, then list the incidents. The run IDs come from each `POST` response.
+A fault run passed as a baseline gets `403 baseline_not_approved`:
+
+```powershell
+$base = "http://127.0.0.1:8000/api/v1"
+$json = "application/json"
+$b1 = (Invoke-RestMethod -Method Post -Uri "$base/simulations" -ContentType $json -Body '{"scenario":"normal_operation","seed":301,"ticks":288}').run_id
+$b2 = (Invoke-RestMethod -Method Post -Uri "$base/simulations" -ContentType $json -Body '{"scenario":"normal_operation","seed":302,"ticks":288}').run_id
+$fault = (Invoke-RestMethod -Method Post -Uri "$base/simulations" -ContentType $json -Body '{"scenario":"cpu_saturation","seed":311,"ticks":288}').run_id
+Invoke-RestMethod -Uri "$base/incidents?baseline_run_id=$b1&baseline_run_id=$b2"
+```
+
+To inspect one incident, pass its `incident_id` from that list together with the
+same baseline parameters:
+
+```powershell
+$incidentId = "<incident_id from the list>"
+Invoke-RestMethod -Uri "$base/incidents/$($incidentId)?baseline_run_id=$b1&baseline_run_id=$b2"
+```
+
 ## Configuration
 
 Settings are read from environment variables when the app starts. Invalid
@@ -598,6 +896,7 @@ values stop startup with a message that names the problem.
 |----------|--------|---------|--------|
 | `AEGIS_ENVIRONMENT` | `development`, `production` | `production` | Deployment environment. An unset value fails closed. |
 | `AEGIS_SIMULATION_API_ENABLED` | `true`, `false` | `false` | Registers `POST /api/v1/simulations`. |
+| `AEGIS_TRUSTED_BASELINES_PATH` | Path to a manifest | Unset | Loads approved baselines for incident detection. Development only. Unset trusts no baseline. |
 
 **Production guard.** The simulation endpoint has no authentication, so the
 settings refuse to enable it in production. Setting
@@ -606,6 +905,12 @@ stops the app from starting. When the endpoint is disabled, its route does not
 exist, so requests to it return `404`. This guard cannot be lifted by a
 configuration change; it needs the authentication design in
 [architecture §5](docs/architecture.md#5-security-architecture-planned).
+
+**Trusted baselines.** `AEGIS_TRUSTED_BASELINES_PATH` names a manifest written by
+`scripts/approve_baselines.py`. The app re-checks every entry on load and refuses
+the whole file if any entry is faulty or altered. Setting it in production stops
+startup, the same way the simulation guard does. Without it, every incident request
+that names a baseline is refused with `403`.
 
 **Loopback binding is not authentication.** `--host 127.0.0.1` makes the server
 reachable only from the local machine. It does not identify callers, so every

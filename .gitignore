@@ -39,6 +39,9 @@ sqlnet.ora
 # Generated analysis output (charts from scripts/plot_telemetry.py)
 artifacts/
 
+# Local trusted-baseline manifests (scripts/approve_baselines.py output)
+local/
+
 # Logs and temporary files
 *.log
 logs/

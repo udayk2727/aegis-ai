@@ -3,6 +3,7 @@
 from fastapi import Request
 
 from app.services.event_store import EventStore
+from app.services.baseline_trust import TrustedBaselines
 
 
 def get_event_store(request: Request) -> EventStore:
@@ -13,3 +14,9 @@ def get_event_store(request: Request) -> EventStore:
     """
     store: EventStore = request.app.state.event_store
     return store
+
+
+def get_trusted_baselines(request: Request) -> TrustedBaselines:
+    """Return the baseline registry owned by this application instance."""
+    trusted: TrustedBaselines = request.app.state.trusted_baselines
+    return trusted
