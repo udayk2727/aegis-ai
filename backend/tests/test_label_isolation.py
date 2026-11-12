@@ -23,6 +23,14 @@ DETECTION_AND_CORRELATION = (
     "services/topology.py",
     "services/incident_pipeline.py",
     "routers/incidents.py",
+    "routers/incident_access.py",
+    "domain/investigation_records.py",
+    "services/investigation_catalog.py",
+    "services/investigation_observations.py",
+    "services/hypotheses.py",
+    "services/investigation.py",
+    "services/investigation_provenance.py",
+    "routers/investigations.py",
 )
 LABEL_ATTRIBUTES = {"label", "is_anomalous", "scenario_id", "anomaly_window"}
 LABEL_NAMES = {"GroundTruthLabel", "ScenarioId"}
@@ -36,6 +44,7 @@ OFFLINE_ONLY_MODULES = {
     "app.services.baseline",
     "app.services.evaluation",
     "app.services.experiment",
+    "app.services.investigation_evaluation",
 }
 
 

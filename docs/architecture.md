@@ -5,7 +5,9 @@ foundation (`GET /`, `GET /health`), an in-memory simulation engine with
 `POST /api/v1/simulations` and `GET /api/v1/events` (section 10), read-only
 analytics and baselines (section 11), offline statistical anomaly detection
 in the Python library (section 12), and offline incident correlation with
-read-only `GET /api/v1/incidents` endpoints (section 13). Everything else below
+read-only `GET /api/v1/incidents` endpoints (section 13), and a read-only,
+deterministic investigation report per incident (section 14). Everything else
+below
 is planned and will be refined as each phase is implemented.
 
 ## 1. Purpose
@@ -74,7 +76,7 @@ intended to:
 | Statistical detection  | Z-score and robust detectors, held-out evaluation       | Started (library, offline) |
 | Ingestion              | Accept and normalize alerts, logs, and metrics          | Planned |
 | Correlation engine     | Group related signals into incidents                    | Started (offline, read-only API) |
-| Investigation agents   | Gather context and propose root-cause hypotheses        | Planned |
+| Investigation agents   | Gather context and propose candidate explanations       | Started (deterministic rules, read-only; section 14) |
 | Approval gate          | Hold recommended actions until a human approves         | Planned |
 | Action executor        | Perform approved remediation through audited adapters   | Planned |
 | Audit log              | Append-only record of decisions and actions             | Planned |
@@ -176,7 +178,7 @@ retrieval shape the database adapter will need, not a persistence design.
 | 1     | Configuration, logging, and domain models     | Partial: telemetry models, simulation engine (section 10), analytics (section 11), detectors (section 12) |
 | 2     | Signal ingestion and incident correlation     | Partial: correlation and incident API (section 13); ingestion planned |
 | 3     | Authentication and authorization              | Planned     |
-| 4     | Investigation agents with LLM adapter         | Planned     |
+| 4     | Investigation agents with LLM adapter         | Partial: deterministic rule-based investigation (section 14); LLM adapter planned |
 | 5     | Approval workflow and audit log               | Planned     |
 | 6     | Controlled action execution                   | Planned     |
 | 7     | Frontend dashboard and workspace              | Planned     |
@@ -1130,3 +1132,228 @@ deterministic.
 - The result is conditional on the simulator. Its faults are large step changes,
   and its normal behaviour is stationary. Check the window again on real
   telemetry, with held-out runs chosen before the check.
+
+## 14. Evidence-based investigation
+
+Status: **Implemented, read-only, deterministic, offline.** For one incident, the
+investigation separates verified observations from hypotheses, records
+contradictory and missing evidence, and suggests read-only checks. It calls no
+language model, writes no state, and sends no telemetry anywhere. Usage is in the
+[README](../README.md#investigation).
+
+### 14.1 Components
+
+| Module | Responsibility | Labels |
+|--------|----------------|--------|
+| `app/domain/investigation_records.py` | Pydantic contracts and the cross-reference validator | Never read |
+| `app/services/investigation_catalog.py` | Fixed hypothesis rules, source gaps, and check descriptions | Never read |
+| `app/services/investigation_observations.py` | Verified observations from the incident and the source-run verdicts | Never read |
+| `app/services/hypotheses.py` | Rule application, contradictions, missing evidence, ranking | Never read |
+| `app/services/investigation.py` | Report assembly, missing evidence, suggested checks, deterministic ID | Never read |
+| `app/services/investigation_evaluation.py` | Offline scoring against simulator labels | Reads labels; offline only |
+| `app/services/incident_pipeline.py` (`score_run`) | Verdicts for one source run, from the same fit as `build_incidents` | Never read |
+| `app/routers/incident_access.py` | Baseline trust and store snapshot, shared with the incident endpoints | Never read |
+| `app/routers/investigations.py` | `GET /api/v1/incidents/{incident_id}/investigation` | Never read |
+| `app/services/investigation_provenance.py` | Provenance checks, run by the API before a report is returned | Never read |
+
+The label-isolation test (`test_label_isolation.py`) covers every module above
+except the evaluator. It fails on any label read or label import, and it fails if
+a detection-side module reaches an offline module through any chain of imports.
+
+### 14.2 Pipeline
+
+1. The request takes one snapshot of the store. The incident is built from it,
+   and so are the verdicts for its source run. Both come from the same snapshot,
+   so they refer to the same data.
+2. Verified observations are built from the incident's evidence and the verdicts.
+3. Each fixed rule is applied to the observations. The rule either generates a
+   hypothesis or records why it did not.
+4. Missing evidence, contradictions, and suggested checks are assembled.
+5. The report gets a deterministic ID, `inv-` followed by 16 hex digits of a
+   SHA-256 hash of the incident ID and the analysis version.
+6. Cited event lists are capped (14.3). The report gets its ranking caveat.
+7. The API checks every cited reference against the stored events of the source
+   run (14.3). A report that fails the check is not returned. A failed analysis
+   or check returns a generic `500 analysis_failed`, and its cause is logged on
+   the server only.
+
+### 14.3 Verified observations and provenance
+
+- Three kinds: `anomalous_series`, `normal_series`, and `onset_order`. Each one
+  cites the stored event IDs it was computed from.
+- Only measurements that contributed to an alert produce an anomaly or an onset.
+  Context samples before onset are excluded, as in section 13.4. The anomaly
+  statement gives the detector's score range against its threshold, which is
+  the baseline deviation, and it counts the excluded samples.
+- A `normal_series` observation requires normal verdicts in the span and no alert
+  contribution. It does not claim that the series never moved.
+- The `Investigation` validator rejects any dangling reference. Each hypothesis
+  cites observations that exist, and its supporting event IDs equal the union of
+  those observations' events. Each contradiction belongs to a hypothesis that lists
+  it. Ranks run from 1 without gaps, and the status matches whether any hypothesis
+  exists.
+- **Provenance is checked before a report is returned.**
+  `investigation_provenance.provenance_violations` requires that each cited event
+  exists in the stored run, belongs to the source run, is on a series the
+  observation names, and falls inside the analysis span. Each observation and
+  gap must also fall inside the span. Each hypothesis may cite only events that a
+  supporting observation lists, and every observation it references must exist.
+  The offline evaluator calls the same function (14.6).
+- **Bounded citations.** Each cited event list keeps at most
+  `investigation.max_cited_events` IDs (default 100, configurable through
+  `AEGIS_INVESTIGATION_MAX_CITED_EVENTS`, range 1 to 1000). The total is kept in
+  `source_event_count`, `supporting_event_count`, or the gap or contradiction's
+  `source_event_count`. A `*_truncated` flag must match the counts, and the report
+  sets `evidence_truncated` when any list is shortened. A capped hypothesis lists
+  only events that a listed observation shows. Ranking, statements, and status are
+  computed before the cap and do not depend on it.
+
+### 14.4 Hypothesis rules
+
+| Pattern | Primary signal | Corroborating | Competing (must be normal) | Expected order |
+|---------|----------------|---------------|----------------------------|----------------|
+| Database query performance degradation | `db_query_latency_ms`, orders-db | `request_latency_ms`, orders-service | none | database before request latency |
+| CPU resource saturation | `cpu_utilization_percent`, orders-service | `request_latency_ms`, orders-service | none | CPU before request latency |
+| Application processing bottleneck | `request_latency_ms`, orders-service | none | CPU, orders-service; database query latency | none |
+| API error propagation | `http_error_count`, orders-service | `http_error_count`, api-gateway | none | none |
+| Database connectivity problem | `db_connection_failures`, orders-service | none | none | none |
+
+Decisions:
+
+- **Minimum primary ticks.** The primary signal must contribute to at least
+  `MIN_PRIMARY_ALERT_TICKS` (2) alert ticks. One sample that crosses a threshold
+  is what a noisy count produces, so it is not a pattern. The value is one
+  constant in `investigation_catalog.py`. It was chosen after one probe of the
+  simulator's fault scenarios on seeds 301, 302, and 311. The probe showed
+  single-tick hypotheses from noise, which is why the rule exists. Seeds 301 and
+  302 are also the local development baseline seeds, so the probe used seeds that
+  are not evaluation seeds. The value was not tuned on evaluation seeds 601 to 610.
+- **Competing signals.** A competing signal that is anomalous, or has no verdict,
+  stops the rule. The report records which signal stopped it.
+- **Contradictions.** A corroborating signal measured normal is contradicting,
+  because the hypothesis expected it to move. An onset order that runs backwards
+  is contradicting. Temporal precedence is necessary for a causal reading, but it
+  is not sufficient.
+- **Status and verification.** A hypothesis is `supported`, or
+  `supported_with_contradictions` when it has any contradicting observation. Its
+  verification status is always `unverified`, and the validator enforces it.
+- **Alternatives.** Each hypothesis lists the other hypotheses generated for the
+  same incident.
+
+### 14.5 Ranking
+
+Hypotheses are ordered by fewer contradicting observations, then by more
+anomaly-based supporting observations (not counting normal ones), then by catalog
+order. The ordering is an aid for review. It is not a probability or a confidence
+score, and the report states this in `ranking_basis`.
+
+**Roles.** Each hypothesis carries a `role`. `downstream_symptom` marks an effect
+that a fault elsewhere would produce. `api_error_propagation` is the only such rule,
+because errors passed up a call chain do not show where they started.
+`potential_initiating_fault` marks a condition that could start the degradation.
+The role is fixed in the catalog and does not change the ranking.
+
+**Ranking caveat.** Every report carries `ranking_caveat`. It states that the order
+reflects heuristic evidence support, that it favours more corroborating series,
+and that it is not a measure of causal certainty. When rank 1 is a downstream
+symptom and a potentially initiating hypothesis was also generated, the caveat
+names both. All generated hypotheses stay in the report, each still unverified.
+
+**Known weakness.** Ranking counts observations, so it favours a hypothesis with
+more corroborating series. In connection-failure runs, `api_error_propagation`
+ranks above `database_connectivity_problem` in every evaluated run, because the
+first has two anomalous error series and the second has one. Section 14.7 reports
+this. The ordering was not changed after the held-out results were viewed. Changing
+it now would tune on evaluation data. A causal ranking that weighs specificity is
+future work. It needs its own design and validation on seeds that were not viewed,
+and its choice is an owner decision.
+
+### 14.6 Evaluation methodology
+
+- `investigation_evaluation.py` is the only label-aware module in this section. It
+  is offline, and the test suite keeps it out of the router's import graph.
+- Five properties are measured per run:
+  - **Window agreement.** Each incident is in window when its alert ticks overlap
+    the span the simulator labelled anomalous. Otherwise it is a false positive.
+    The detector is not tuned on this count. Normal runs have no labelled window,
+    so all their incidents are false positives.
+  - **Provenance.** Every cited event ID resolves to a stored event of the source
+    run, of the named series, inside the span. This is the check the API applies
+    before returning a report (14.3).
+  - **Support.** Every hypothesis cites at least one non-normal observation.
+  - **Reproducibility.** Rebuilding the incidents and reports from the same runs
+    gives identical reports.
+  - **Scenario agreement.** Whether the hypothesis that matches the simulator fault
+    is generated, and whether it ranks first. This is agreement with a label, not
+    causal accuracy.
+- Baselines are seeds 101 to 104. Evaluation seeds 601 to 610 at 60 ticks were not
+  used to choose any rule or threshold. Run it with
+  `python scripts/evaluate_investigations.py`.
+- A faulty baseline stops the evaluation with `BaselineRejected`, as in the
+  correlation sweep.
+
+### 14.7 Results on the simulator
+
+Output of `scripts/evaluate_investigations.py`, 50 runs (10 per scenario):
+
+| Scenario | Incidents | In window | False positives | Provenance failures | Unsupported | Irreproducible | Pattern present | Pattern first | Contradictions |
+|----------|----------:|----------:|----------------:|--------------------:|------------:|---------------:|----------------:|--------------:|---------------:|
+| normal_operation | 0 | 0 | 0 | 0 | 0 | 0 | n/a | n/a | 0 |
+| database_latency_spike | 10 | 10 | 0 | 0 | 0 | 0 | 10 | 10 | 1 |
+| cpu_saturation | 10 | 10 | 0 | 0 | 0 | 0 | 10 | 10 | 1 |
+| api_errors | 10 | 10 | 0 | 0 | 0 | 0 | 10 | 10 | 0 |
+| connection_failure | 11 | 10 | 1 | 0 | 0 | 0 | 10 | 0 | 0 |
+
+- **The 11 connection-failure incidents are 10 in window and 1 false positive.**
+  Seed 606 produces a second incident: one alert tick at 00:59, 20 minutes after
+  the labelled window closed, where three series crossed the threshold together.
+  It is a single-tick group, which the selected Day 4 rule allows
+  (`min_consecutive_ticks=1`). Its report is `insufficient_evidence`, with no
+  hypotheses. The detector was not changed.
+- The integrity checks pass in every run. Normal runs produce no incident.
+- The expected pattern is generated in every fault run. It ranks first except in
+  connection failure (14.5).
+- Contradictions are rare. In the database and CPU sets, each contains one
+  `api_error_propagation` hypothesis from orders-service error ticks, with the
+  gateway measured normal. The simulator's clean step faults leave few conflicts.
+
+### 14.8 Limitations
+
+- **Simulator only.** Faults are large step changes that affect one tier at a
+  time. The baseline is stationary.
+- **Missing sources.** Query traces, application logs, host metrics, connection
+  pool limits, and change records are not in the telemetry model. Each report
+  lists the affected hypotheses under `missing_evidence` with the check that would
+  read the source.
+- **Upper-tail detector.** A fall in `active_db_connections` is outside the
+  detector's direction, so it cannot appear as evidence. The report records this
+  as `direction_not_evaluated`.
+- **Rules are authored.** They were written from the simulator's documented fault
+  effects and the declared topology. Other rule sets could give other answers.
+- **Count-based ranking.** See 14.5.
+- **Single incident.** Each report is computed from one incident. No reasoning
+  spans incidents.
+- **No persistence.** Reports are recomputed per request from the in-memory store,
+  as in section 13.10. Development-only, like the incident endpoints (section 5).
+- **Recomputation cost.** Each request fits the detector twice, once for the
+  incident and once for the verdicts, and scores the whole store. The store is
+  capped at 50,000 events, but the cost is not bounded beyond that. The cited-event
+  cap (14.3) bounds the response, not the work. Caching per store snapshot is future
+  work.
+- **Truncated citations.** A capped list shows only some event IDs. The total and
+  the flag say so, but the report does not list the rest. There is no endpoint that
+  lists them, so a reader cannot verify beyond the listed IDs through the API.
+
+### 14.9 Future LLM agent integration (planned, not implemented)
+
+No model call exists in this code, and no provider adapter does either. The
+intended design, which needs its own approval and an authentication design under
+section 5, is:
+
+- An agent may write narrative text from a report. It must cite the report's
+  observation IDs and event IDs, and the provenance check then applies to its
+  output.
+- Model output stays untrusted (section 5, rule 9). It is validated against the
+  report before it is shown, and it never supplies a command, query, or URL.
+- An agent may propose further read-only checks. It may not run them against a
+  live system without the approval gate in section 2.

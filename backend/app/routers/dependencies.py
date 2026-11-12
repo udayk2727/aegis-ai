@@ -20,3 +20,9 @@ def get_trusted_baselines(request: Request) -> TrustedBaselines:
     """Return the baseline registry owned by this application instance."""
     trusted: TrustedBaselines = request.app.state.trusted_baselines
     return trusted
+
+
+def get_investigation_cap(request: Request) -> int:
+    """Return the configured cap on cited event IDs per investigation list."""
+    cap: int = request.app.state.investigation_max_cited_events
+    return cap

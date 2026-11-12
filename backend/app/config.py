@@ -13,13 +13,20 @@ requires the authentication design in docs/architecture.md, not a config change.
 from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Self
+from typing import Annotated, Any, Self
 
-from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    model_validator,
+)
 
 ENVIRONMENT_VARIABLE = "AEGIS_ENVIRONMENT"
 SIMULATION_API_VARIABLE = "AEGIS_SIMULATION_API_ENABLED"
 TRUSTED_BASELINES_VARIABLE = "AEGIS_TRUSTED_BASELINES_PATH"
+INVESTIGATION_CAP_VARIABLE = "AEGIS_INVESTIGATION_MAX_CITED_EVENTS"
 
 
 class Environment(StrEnum):
@@ -41,6 +48,7 @@ class Settings(BaseModel):
     environment: Environment = Environment.PRODUCTION
     simulation_api_enabled: bool = False
     trusted_baselines_path: Path | None = None
+    investigation_max_cited_events: Annotated[int, Field(ge=1, le=1000)] = 100
 
     @model_validator(mode="after")
     def _development_only_features(self) -> Self:
@@ -69,6 +77,8 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         raw["simulation_api_enabled"] = environ[SIMULATION_API_VARIABLE]
     if TRUSTED_BASELINES_VARIABLE in environ:
         raw["trusted_baselines_path"] = environ[TRUSTED_BASELINES_VARIABLE]
+    if INVESTIGATION_CAP_VARIABLE in environ:
+        raw["investigation_max_cited_events"] = environ[INVESTIGATION_CAP_VARIABLE]
     try:
         return Settings.model_validate(raw)
     except ValidationError as error:

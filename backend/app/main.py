@@ -14,7 +14,14 @@ from fastapi import FastAPI
 
 from app import __version__
 from app.config import Settings, load_settings
-from app.routers import analytics, events, incidents, simulations, system
+from app.routers import (
+    analytics,
+    events,
+    incidents,
+    investigations,
+    simulations,
+    system,
+)
 from app.services.event_store import DEFAULT_EVENT_CAPACITY, EventStore
 from app.services.baseline_trust import TrustedBaselines
 from app.services.trusted_baselines import load_trusted_baselines
@@ -51,12 +58,16 @@ def create_app(
     )
     application.state.event_store = EventStore(max_events=event_capacity)
     application.state.trusted_baselines = trusted_baselines
+    application.state.investigation_max_cited_events = (
+        settings.investigation_max_cited_events
+    )
     application.include_router(system.router)
     if settings.simulation_api_enabled:
         application.include_router(simulations.router)
     application.include_router(events.router)
     application.include_router(analytics.router)
     application.include_router(incidents.router)
+    application.include_router(investigations.router)
     return application
 
 

@@ -106,28 +106,8 @@ def build_incidents(
     case matters because evidence reads each value by event ID, so a repeated ID
     could copy the value of the wrong event.
     """
-    baseline_ids = tuple(sorted(set(baseline_run_ids)))
-    if not baseline_ids:
-        raise ValueError("at least one baseline run is required")
-    known_ids = {run.run_id for run in runs}
-    unknown = [run_id for run_id in baseline_ids if run_id not in known_ids]
-    if unknown:
-        raise ValueError(f"baseline run not found: {unknown[0]}")
-    unapproved = [run_id for run_id in baseline_ids if not trusted.is_approved(run_id)]
-    if unapproved:
-        raise ValueError(f"baseline run is not approved: {unapproved[0]}")
-    for run in runs:
-        if len({event.event_id for event in run.events}) != len(run.events):
-            raise ValueError(f"run {run.run_id} repeats an event ID")
-
-    baseline_events = [
-        event
-        for run in runs
-        if run.run_id in baseline_ids
-        for event in run.events
-    ]
-    detector = detector_factory()
-    detector.fit(baseline_events)
+    baseline_ids = _checked_baselines(runs, baseline_run_ids, trusted)
+    detector = _fit_baseline(runs, baseline_ids, detector_factory)
 
     incidents: list[Incident] = []
     for run in sorted(runs, key=lambda item: item.run_id):
@@ -146,6 +126,72 @@ def build_incidents(
         incidents,
         key=lambda item: (item.first_detection_at, item.incident_id),
     )
+
+
+def score_run(
+    runs: Sequence[ObservedRun],
+    baseline_run_ids: Collection[str],
+    run_id: str,
+    *,
+    trusted: TrustedBaselines,
+    detector_factory: Callable[[], AnomalyDetector] = selected_detector,
+) -> tuple[Prediction, ...]:
+    """Return the fitted detector's verdict on every event of one non-baseline run.
+
+    The baseline is fitted exactly as ``build_incidents`` fits it, so these are
+    the verdicts from which that run's incidents were derived. Investigations use
+    them to find normal measurements, which incidents do not carry. Baseline runs
+    are refused, because the model is never scored on its own training data.
+    Raises ValueError under the same conditions as ``build_incidents``, or when
+    ``run_id`` is not among ``runs``.
+    """
+    baseline_ids = _checked_baselines(runs, baseline_run_ids, trusted)
+    if run_id in baseline_ids:
+        raise ValueError("a baseline run is never scored")
+    matches = [run for run in runs if run.run_id == run_id]
+    if not matches:
+        raise ValueError(f"run not found: {run_id}")
+    detector = _fit_baseline(runs, baseline_ids, detector_factory)
+    return tuple(detector.predict(matches[0].events))
+
+
+def _checked_baselines(
+    runs: Sequence[ObservedRun],
+    baseline_run_ids: Collection[str],
+    trusted: TrustedBaselines,
+) -> tuple[str, ...]:
+    """Return the sorted baseline IDs after checking presence, approval, and events."""
+    baseline_ids = tuple(sorted(set(baseline_run_ids)))
+    if not baseline_ids:
+        raise ValueError("at least one baseline run is required")
+    known_ids = {run.run_id for run in runs}
+    unknown = [run_id for run_id in baseline_ids if run_id not in known_ids]
+    if unknown:
+        raise ValueError(f"baseline run not found: {unknown[0]}")
+    unapproved = [run_id for run_id in baseline_ids if not trusted.is_approved(run_id)]
+    if unapproved:
+        raise ValueError(f"baseline run is not approved: {unapproved[0]}")
+    for run in runs:
+        if len({event.event_id for event in run.events}) != len(run.events):
+            raise ValueError(f"run {run.run_id} repeats an event ID")
+    return baseline_ids
+
+
+def _fit_baseline(
+    runs: Sequence[ObservedRun],
+    baseline_ids: Collection[str],
+    detector_factory: Callable[[], AnomalyDetector],
+) -> AnomalyDetector:
+    """Fit a new detector on the events of the baseline runs only."""
+    baseline_events = [
+        event
+        for run in runs
+        if run.run_id in baseline_ids
+        for event in run.events
+    ]
+    detector = detector_factory()
+    detector.fit(baseline_events)
+    return detector
 
 
 def _run_incidents(scoring: _Scoring) -> list[Incident]:
@@ -183,6 +229,8 @@ def _incident(
     gaps: Sequence[TelemetryGap],
 ) -> Incident:
     """Assemble the incident for one group of alerts from one run."""
+    if not group:
+        raise ValueError("an alert group is empty")
     run = scoring.run
     window = timedelta(seconds=scoring.correlation.window_seconds)
     first_detection = group[0].timestamp

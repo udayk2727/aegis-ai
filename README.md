@@ -34,6 +34,10 @@ Available now:
 - `GET /api/v1/incidents` and `GET /api/v1/incidents/{incident_id}`: read-only
   incidents correlated from detection alerts, with evidence and a timeline
   (see [Incident correlation](#incident-correlation))
+- `GET /api/v1/incidents/{incident_id}/investigation`: read-only, deterministic
+  investigation report with verified observations, ranked hypotheses,
+  contradictory and missing evidence, and read-only checks
+  (see [Investigation](#investigation))
 - Automated tests with pytest
 
 Planned (see [docs/architecture.md](docs/architecture.md)):
@@ -63,7 +67,8 @@ aegis-ai/
 │   ├── app/          Application package
 │   │   ├── domain/       Pydantic telemetry models (no I/O)
 │   │   ├── routers/      HTTP endpoints, one module per feature
-│   │   └── services/     Simulation engine, event store, analytics, and detectors
+│   │   └── services/     Simulation engine, event store, analytics, detectors,
+│   │                     incident correlation, and investigation
 │   └── tests/        pytest suite
 ├── scripts/          Offline analysis scripts (charts, detector evaluation)
 ├── local/            Git-ignored local manifests (trusted baselines)
@@ -853,7 +858,7 @@ Approve the two normal baseline seeds offline. This writes
 be approved, and the script stops if any candidate contains an injected fault:
 
 ```powershell
-.\.venv\Scripts\python.exe scriptspprove_baselines.py --seeds 301 302 --ticks 288
+.\.venv\Scripts\python.exe scripts\approve_baselines.py --seeds 301 302 --ticks 288
 ```
 
 Run the API locally with the simulation endpoint enabled, and with the approved
@@ -862,7 +867,7 @@ baselines loaded. Both variables are development-only:
 ```powershell
 $env:AEGIS_ENVIRONMENT = "development"
 $env:AEGIS_SIMULATION_API_ENABLED = "true"
-$env:AEGIS_TRUSTED_BASELINES_PATH = "local	rusted_baselines.json"
+$env:AEGIS_TRUSTED_BASELINES_PATH = "local\trusted_baselines.json"
 .\.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000
 ```
 
@@ -887,6 +892,246 @@ $incidentId = "<incident_id from the list>"
 Invoke-RestMethod -Uri "$base/incidents/$($incidentId)?baseline_run_id=$b1&baseline_run_id=$b2"
 ```
 
+To produce the investigation report for that incident, and to run the offline
+evaluation of every investigation (see [Investigation](#investigation)):
+
+```powershell
+$incident = (Invoke-RestMethod -Uri "$base/incidents?baseline_run_id=$b1&baseline_run_id=$b2&run_id=$fault").items[0].incident_id
+Invoke-RestMethod -Uri "$base/incidents/$incident/investigation?baseline_run_id=$b1&baseline_run_id=$b2" | ConvertTo-Json -Depth 8
+.\.venv\Scripts\python.exe scripts\evaluate_investigations.py
+```
+
+## Investigation
+
+The investigation layer reads one incident and the verdicts for its source run,
+then produces a structured report. The report separates what was measured from
+the patterns that measurement might fit, and it says what is missing. It is
+deterministic, read-only, and offline. It calls no language model and sends no
+telemetry anywhere. Its code is in `backend/app/services/investigation*.py`
+and `hypotheses.py`, and the design is in
+[docs/architecture.md](docs/architecture.md#14-evidence-based-investigation).
+
+> **Correlation and timing do not prove causation.** A hypothesis is a candidate
+> pattern. Every hypothesis is `unverified`, and `root_cause_assessment` is always
+> `not_assessed`. The report names what would be needed to test each one.
+
+### What a report contains
+
+| Part | Meaning |
+|------|---------|
+| `verified_observations` | Facts computed from stored events. Each cites the event IDs it came from. |
+| `hypotheses` | Candidate patterns, ranked. Each has a `role`, lists supporting and contradicting observation IDs, and names the other hypotheses generated for the same incident. |
+| `ranking_caveat` | The limits of the ordering, stated on every report. If a downstream symptom holds rank 1 while a potentially initiating fault was also generated, the caveat names both. |
+| `contradictory_evidence` | An observation a hypothesis expected but did not get, or one that came out of order. |
+| `missing_evidence` | What could not be checked, such as query traces, which the telemetry model does not collect. |
+| `suggested_checks` | Read-only follow-up checks. None changes state or touches a live system. |
+| `limitations` | Standing limits of the analysis. |
+
+Each hypothesis `role` is one of `potential_initiating_fault` or
+`downstream_symptom`. A downstream symptom is an effect that a fault elsewhere
+would produce. `api_error_propagation` is the only such rule. The role is fixed by
+the rule catalog and does not change the ranking.
+
+Cited event lists can be bounded (see [Response bounds](#response-bounds)). When a
+list is shortened, its total is kept next to it, and a `*_truncated` flag says
+so.
+
+### Verified observations
+
+There are three kinds. Each is computed from stored events, and each cites the
+event IDs it came from:
+
+- `anomalous_series`: a series with measurements that contributed to an alert.
+  Context samples from before onset do not count, but the statement reports how
+  many were excluded, along with the detector's score range against its
+  threshold.
+- `normal_series`: a series with normal verdicts in the span and no alert
+  contribution. The statement says so. It does not claim the series never moved.
+- `onset_order`: the first alert-contributing measurement of two series, in the
+  order they occurred.
+
+### Evidence provenance
+
+Every cited reference is checked before the report is returned, by
+`app/services/investigation_provenance.py`. The check requires that:
+
+- each cited event exists in the stored run,
+- the event belongs to the source run,
+- the event is on a series the observation names,
+- each observation, and each event it cites, falls inside the analysis span,
+- each hypothesis cites only events that a supporting observation lists, and
+  every observation it references exists in the report.
+
+A report that fails any check is not returned. The API answers with the generic
+`500 analysis_failed` and logs the first violation on the server. The offline
+evaluator uses the same check, so the numbers in the evaluation below test the
+code the API runs.
+
+### Hypothesis rules
+
+Each rule is a fixed declaration. A rule applies only when its primary signal
+contributed to alerts at two or more ticks, and each competing signal is measured
+normal. A single noisy sample is not treated as a pattern.
+
+| Hypothesis | Primary signal | Expects | Must be normal |
+|------------|----------------|---------|----------------|
+| `database_query_performance_degradation` | `db_query_latency_ms` on orders-db | `request_latency_ms` on orders-service, after the database signal | none |
+| `cpu_resource_saturation` | `cpu_utilization_percent` on orders-service | `request_latency_ms` on orders-service, after the CPU signal | none |
+| `application_processing_bottleneck` | `request_latency_ms` on orders-service | none | CPU on orders-service, database query latency |
+| `api_error_propagation` | `http_error_count` on orders-service | `http_error_count` on api-gateway | none |
+| `database_connectivity_problem` | `db_connection_failures` on orders-service | none | none |
+
+A corroborating signal that is measured normal is recorded as contradicting
+evidence. So is an onset order that runs backwards. Temporal precedence is
+necessary for a causal reading, but it is not sufficient.
+
+Hypotheses are ranked by fewer contradicting observations, then more
+anomaly-based supporting observations, then fixed catalog order. This orders
+candidates for review. It is not a probability.
+
+**Ranking limitations.** The count favours a rule with more corroborating
+series. In connection-failure runs, the downstream `api_error_propagation` ranks
+above the potentially initiating `database_connectivity_problem`. Each report
+states this in `ranking_caveat`, and the role field marks the symptom. Every
+generated hypothesis is kept with its alternatives. The ranking was not changed
+after the held-out results were viewed, so it is not tuned on those seeds. A
+causal ranking that weighs specificity is future work. It needs its own design and
+its own validation on seeds that were not viewed.
+
+**Choice of `MIN_PRIMARY_ALERT_TICKS`.** A rule applies only when its primary
+signal contributed to alerts at two or more ticks. This is one constant in
+`investigation_catalog.py`. It was chosen after one probe of the simulator's
+fault scenarios on seeds 301, 302, and 311. Those are development seeds, and seeds
+301 and 302 are also the local baseline seeds. None of them is an evaluation seed.
+The probe showed that single-tick matches were noise, which is why the rule exists.
+The value was not tuned on the evaluation seeds 601 to 610.
+
+### Endpoint
+
+```text
+GET /api/v1/incidents/{incident_id}/investigation?baseline_run_id=<run>[&baseline_run_id=<run>]
+```
+
+It applies the same baseline trust as the incident endpoints. An unapproved
+baseline returns `403 baseline_not_approved`. An unstored one returns
+`404 baseline_run_not_found`, and an unknown incident returns
+`404 incident_not_found`. A malformed incident ID or a missing baseline returns
+`422`. A failed analysis, including a provenance violation, returns
+`500 analysis_failed` with a fixed message and no detail. Only `GET` is allowed,
+so other methods return `405`.
+
+### Response bounds
+
+Each cited event list is capped at `investigation.max_cited_events`, which
+defaults to 100 and can be set with `AEGIS_INVESTIGATION_MAX_CITED_EVENTS`
+(1 to 1000). The cap changes only which IDs are listed. Each capped list keeps its
+total next to the listed IDs: `source_event_count` on an observation, a
+contradiction, or a gap, and `supporting_event_count` on a hypothesis. A
+`*_truncated` flag sits beside each total and must agree with the counts. The
+report sets `evidence_truncated` when any list is shortened. Ranking, statements, and status are computed before the cap
+and do not change with it.
+
+The cap bounds the listed references, not the work. Each request still fits the
+detector twice and scores the store, which is capped at 50,000 events. Caching is
+future work.
+
+Abridged output for the database-latency fault at 288 ticks, seed 311, with
+baselines 301 and 302:
+
+```json
+{
+  "status": "analyzed",
+  "root_cause_assessment": "not_assessed",
+  "hypotheses": [
+    {
+      "kind": "database_query_performance_degradation",
+      "rank": 1,
+      "status": "supported",
+      "verification_status": "unverified",
+      "supporting_observation_ids": [
+        "obs-anomalous_series-orders-db-db_query_latency_ms",
+        "obs-anomalous_series-orders-service-request_latency_ms",
+        "obs-onset_order-orders-db-db_query_latency_ms-orders-service-request_latency_ms"
+      ],
+      "contradicting_observation_ids": [],
+      "alternative_kinds": []
+    }
+  ],
+  "suggested_checks": [
+    {"kind": "review_query_traces", "read_only": true},
+    {"kind": "review_change_records", "read_only": true}
+  ]
+}
+```
+
+### Evaluation
+
+`scripts/evaluate_investigations.py` scores every investigation offline against
+the simulator's labels. It uses seeds 601 to 610 at 60 ticks, which were not used
+to choose any rule. Baselines are seeds 101 to 104. Output from the default run:
+
+| Scenario | Runs | Incidents | In window | False positives | Provenance failures | Unsupported hypotheses | Irreproducible runs | Expected pattern present | Expected ranked first | Contradictions |
+|----------|-----:|----------:|----------:|----------------:|--------------------:|-----------------------:|--------------------:|-------------------------:|----------------------:|---------------:|
+| normal_operation | 10 | 0 | 0 | 0 | 0 | 0 | 0 | n/a | n/a | 0 |
+| database_latency_spike | 10 | 10 | 10 | 0 | 0 | 0 | 0 | 10 | 10 | 1 |
+| cpu_saturation | 10 | 10 | 10 | 0 | 0 | 0 | 0 | 10 | 10 | 1 |
+| api_errors | 10 | 10 | 10 | 0 | 0 | 0 | 0 | 10 | 10 | 0 |
+| connection_failure | 10 | 11 | 10 | 1 | 0 | 0 | 0 | 10 | 0 | 0 |
+
+An incident is **in window** when its alert ticks overlap the span the simulator
+labelled anomalous. Otherwise it is a **false positive**. The evaluation reads
+labels, so this count is offline only. The request path never sees it.
+
+**Why 10 connection-failure runs produced 11 incidents.** Seed 606 has two
+incidents. The first is the fault's own, with 19 alert ticks inside the labelled
+window. The second is one alert tick at 00:59, 20 minutes after the window closed,
+where three series crossed the threshold together. The detector's selected rule
+accepts a single tick (`min_consecutive_ticks=1`, the Day 4 choice), so this is an
+ordinary false positive. The detector was not changed. Its report has no
+hypotheses and is `insufficient_evidence`, which is the correct result for it.
+The other nine connection-failure runs produce exactly one incident each.
+
+What these results show:
+
+- Provenance, support, and reproducibility hold in every run. Normal runs produce
+  no incident, so they produce no investigation.
+- The matching pattern is generated in every fault run. It ranks first in the
+  database, CPU, and API-error runs.
+- **Connection failure is the weak case.** `database_connectivity_problem` is
+  generated in all ten runs, but `api_error_propagation` ranks first in each.
+  The ranking counts observations, and the API rule has two anomalous error
+  series against the connectivity rule's one. The ranking was not changed, because
+  changing it on the evaluation seeds would tune on held-out data. Each report now
+  says so in `ranking_caveat`. Choosing a causal ranking is an owner decision.
+- Contradictions are rare on the simulator, because its faults are clean step
+  changes. The one per set in the database and CPU runs is an
+  `api_error_propagation` hypothesis built from orders-service error ticks, with
+  the gateway measured normal.
+
+Scenario agreement is not causal accuracy. The simulator's fault type is a label,
+not a verified cause. A match shows that the rules fire on the signals they were
+designed for. It does not show that they would find the cause of a real incident.
+
+### Limitations
+
+- The rules and the two-tick threshold were written by the author. The threshold
+  was chosen after a single look at the simulator's output on test seeds 301, 302,
+  and 311. Other choices could give different results.
+- The simulator's faults are large, step-shaped, and affect one tier at a time.
+  Production telemetry will be noisier and less clean.
+- Several hypotheses cannot be checked from stored data: query traces, application
+  logs, host metrics, connection pool limits, and change records are not in the
+  telemetry model. The report lists each one as missing evidence.
+- The upper-tail detector does not flag a fall in `active_db_connections`, so a
+  downward change cannot appear as evidence. The report says so.
+- Ranking counts observations and does not weigh specificity. It is a review aid
+  only, and the report says so in `ranking_caveat`.
+- False-positive counts come from one simulated seed set. They do not estimate a
+  production false-positive rate.
+- The endpoint is development-only, like the other incident endpoints, and it
+  recomputes everything from the in-memory store on each request. Recomputation
+  cost is not bounded beyond the store capacity.
+
 ## Configuration
 
 Settings are read from environment variables when the app starts. Invalid
@@ -897,6 +1142,7 @@ values stop startup with a message that names the problem.
 | `AEGIS_ENVIRONMENT` | `development`, `production` | `production` | Deployment environment. An unset value fails closed. |
 | `AEGIS_SIMULATION_API_ENABLED` | `true`, `false` | `false` | Registers `POST /api/v1/simulations`. |
 | `AEGIS_TRUSTED_BASELINES_PATH` | Path to a manifest | Unset | Loads approved baselines for incident detection. Development only. Unset trusts no baseline. |
+| `AEGIS_INVESTIGATION_MAX_CITED_EVENTS` | Integer, 1 to 1000 | `100` | Caps the event IDs listed per cited evidence list in an investigation. See [Response bounds](#response-bounds). |
 
 **Production guard.** The simulation endpoint has no authentication, so the
 settings refuse to enable it in production. Setting

@@ -16,6 +16,7 @@ def test_all_public_routes_are_registered(client: TestClient) -> None:
         "/api/v1/analytics/timeseries",
         "/api/v1/incidents",
         "/api/v1/incidents/{incident_id}",
+        "/api/v1/incidents/{incident_id}/investigation",
     }
 
 
