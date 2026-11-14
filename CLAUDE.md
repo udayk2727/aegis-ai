@@ -20,6 +20,43 @@ without explicit approval from the project owner:
 - Additional third-party dependencies beyond `requirements.txt` without
   justification in the pull request or commit message
 
+### Day 7 exception: optional local LLM adapter
+
+The project owner has approved one narrow exception to the LLM bullet above. It
+covers optional OpenAI Responses API and Anthropic Messages API providers for the
+investigation agent, for **local development only**:
+
+- The adapters live in `backend/app/services/`. They are used only by three local
+  scripts: `scripts/run_investigation_agent.py`,
+  `scripts/anthropic_connectivity_check.py`, and `scripts/evaluate_agent.py`. A
+  live provider is selected with `--provider openai` or `--provider anthropic`.
+  Every paid execution requires explicit `--live`. There is no automatic live call.
+  The fake provider stays the default.
+- Dependency exception, narrow: the rule above on additional third-party
+  dependencies is relaxed for exactly two packages, the OpenAI Python SDK
+  (`openai==2.54.0`) and the Anthropic Python SDK (`anthropic==0.109.0`). Both are
+  pinned at exact versions in `requirements-llm.txt`, and installed only for local
+  Day 7 development, after the core requirements. They are not part of
+  `requirements.txt`. No other package is added under this exception. Any other
+  new dependency still needs justification in the pull request or commit message,
+  and the owner's approval.
+- It may use only the SDKs pinned in `requirements-llm.txt`. Nothing else is added.
+- Pytest, CI, ordinary imports, and default evaluation runs never call the adapter
+  or make a paid request. Tests use mock clients only. A test module for an optional
+  provider skips cleanly when that provider's SDK is not installed.
+- Credentials come from the environment only: `OPENAI_API_KEY` for the OpenAI
+  provider, `ANTHROPIC_API_KEY` for the Anthropic provider, and `AEGIS_LLM_MODEL`,
+  which has no default. A key is never hardcoded, committed, logged, or printed.
+- The model may request tools. Only the trusted, read-only tool registry runs
+  them, and every model output is verified by the server-side verifier before it
+  is returned.
+
+This exception does **not** cover production use, any new HTTP endpoint, any
+change to authentication or authorization, paid live requests without a separate
+owner authorization, autonomous remediation, or any other provider or dependency.
+Each of those needs its own explicit approval. Every other rule in this file still
+applies in full, including security rules 1 to 10.
+
 ## Repository layout
 
 | Path               | Purpose                                              |

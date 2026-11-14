@@ -31,6 +31,16 @@ DETECTION_AND_CORRELATION = (
     "services/investigation.py",
     "services/investigation_provenance.py",
     "routers/investigations.py",
+    "domain/agent_records.py",
+    "services/agent_provider.py",
+    "services/agent_tools.py",
+    "services/agent_verification.py",
+    "services/agent_orchestration.py",
+    "services/agent_fake_provider.py",
+    "services/agent_openai_provider.py",
+    "services/agent_budget.py",
+    "services/agent_transport.py",
+    "services/agent_anthropic_provider.py",
 )
 LABEL_ATTRIBUTES = {"label", "is_anomalous", "scenario_id", "anomaly_window"}
 LABEL_NAMES = {"GroundTruthLabel", "ScenarioId"}

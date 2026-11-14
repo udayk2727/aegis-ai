@@ -38,12 +38,19 @@ Available now:
   investigation report with verified observations, ranked hypotheses,
   contradictory and missing evidence, and read-only checks
   (see [Investigation](#investigation))
+- Investigation agent library and a local-only CLI. The default provider is
+  deterministic and makes no network call. An optional OpenAI provider runs only
+  with `--provider openai --live`. There is no HTTP endpoint
+  (see [Investigation agent](#investigation-agent))
 - Automated tests with pytest
 
 Planned (see [docs/architecture.md](docs/architecture.md)):
 
 - Signal ingestion from external systems (the correlation runs on simulated data)
-- Investigation agents backed by an LLM adapter
+- Live validation of the OpenAI provider adapter against the API. The adapter
+  exists and is tested offline, but it has not been run against the live service
+- Broader live validation of the Anthropic adapter. One single-case run is recorded;
+  other scenarios, seeds, and repeat runs are not
 - Human approval workflow and audit log
 - Controlled remediation execution
 - Web dashboard and investigation workspace
@@ -903,11 +910,12 @@ Invoke-RestMethod -Uri "$base/incidents/$incident/investigation?baseline_run_id=
 
 ## Investigation
 
-The investigation layer reads one incident and the verdicts for its source run,
+The deterministic investigation layer reads one incident and the verdicts for its source run,
 then produces a structured report. The report separates what was measured from
 the patterns that measurement might fit, and it says what is missing. It is
 deterministic, read-only, and offline. It calls no language model and sends no
-telemetry anywhere. Its code is in `backend/app/services/investigation*.py`
+telemetry anywhere. The LLM investigation agent is a separate, optional layer over
+these reports, described under [Investigation agent](#investigation-agent). Its code is in `backend/app/services/investigation*.py`
 and `hypotheses.py`, and the design is in
 [docs/architecture.md](docs/architecture.md#14-evidence-based-investigation).
 
@@ -1128,9 +1136,287 @@ designed for. It does not show that they would find the cause of a real incident
   only, and the report says so in `ranking_caveat`.
 - False-positive counts come from one simulated seed set. They do not estimate a
   production false-positive rate.
-- The endpoint is development-only, like the other incident endpoints, and it
-  recomputes everything from the in-memory store on each request. Recomputation
-  cost is not bounded beyond the store capacity.
+- The endpoint has no authentication and no runtime guard. It is registered in
+  every environment (`app/main.py`), and it is not gated by the environment
+  setting. In production it returns 403 for any baseline request, because trusted
+  baselines cannot be loaded there. That is an indirect effect, not a guard, and
+  code that builds the app with its own `TrustedBaselines` would expose it. Run
+  it only on a trusted local machine until the authentication design in
+  [architecture.md section 5](docs/architecture.md#5-security-architecture-planned)
+  is accepted. It recomputes everything from the in-memory store on each
+  request, and the recomputation cost is not bounded beyond the store capacity.
+
+### Investigation agent
+
+The LLM investigation agent runs as a Python library and a local-only CLI. It has
+no HTTP endpoint. Its design is in
+[architecture.md section 14.9](docs/architecture.md#149-llm-investigation-agent-fake-and-optional-live-provider).
+
+#### Providers
+
+| Provider | Selected by | Network | SDK pin (`requirements-llm.txt`) | Use |
+|----------|-------------|---------|----------------------------------|-----|
+| `fake` (default) | nothing | none | none | tests and local demonstrations |
+| `openai` | `--provider openai --live` | OpenAI Responses API | `openai==2.54.0` | local development only |
+| `anthropic` | `--provider anthropic --live` | Anthropic Messages API | `anthropic==0.109.0` | local development only |
+
+A live provider runs only with its explicit flags. Pytest, CI, ordinary imports,
+and the default evaluation never use one. Install the optional SDKs after the core
+requirements:
+
+```powershell
+python -m pip install -r requirements-llm.txt
+```
+
+#### Configuration
+
+Credentials and the model come from the environment only. Nothing is read from a
+source file or a `.env` file.
+
+| Variable | Needed for | Notes |
+|----------|-----------|-------|
+| `ANTHROPIC_API_KEY` | `anthropic` | Never logged, printed, or put in a prompt |
+| `OPENAI_API_KEY` | `openai` | Never logged, printed, or put in a prompt |
+| `AEGIS_LLM_MODEL` | both live providers | No default. Use a model identifier you have chosen. Anthropic's model overview lists `claude-sonnet-5-5` as the Sonnet 5.5 API ID. |
+
+Set a key in your own session from your secret store, for example
+`$env:ANTHROPIC_API_KEY = "<key from your secret store>"`. Do not commit it.
+
+Cost estimates need a pricing file, passed with `--pricing-file`. The repository
+ships none. Without one, cost is reported as unknown, never as zero. The file format
+is described in the Cost and usage section below.
+
+Exit codes: `0` verified, `2` refused, `1` no incident was detected, and `3` a
+required setting is missing or invalid, a budget is out of range, or `--live` was not
+given.
+
+#### Offline procedures (no network, no key)
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe scripts\evaluate_agent.py
+.\.venv\Scripts\python.exe scripts\check_llm_environment.py
+```
+
+The preflight checks both SDKs: the Python version, the installed version against
+the pin, the import, client construction with a dummy key, and the resource. It sends
+no request. A pass means the SDK loads here. It does not mean a live adapter works.
+
+#### Live validation: one successful synthetic investigation (Anthropic, 2026-11-13)
+
+One live investigation with the Anthropic provider completed and verified. It is a
+single synthetic case. It is not evidence of general causal accuracy, and it is not
+evidence of production readiness. The OpenAI provider has not been run live.
+
+Configuration, as run:
+
+| Setting | Value |
+|---------|-------|
+| Provider | `anthropic` (Anthropic Messages API), with `--live` |
+| Model | `claude-sonnet-5-5` (Claude Sonnet 5.5) |
+| Answer format | `compact` |
+| Scenario and seed | `cpu_saturation`, seed 601 |
+| Maximum requests | 8 |
+| Maximum tool calls | 6 |
+| Total tokens | 30,000 |
+| Maximum output tokens | 1,000 |
+| Request timeout | 30 seconds (the default) |
+| Deadline | 180 seconds |
+| Retries | 0 |
+| Pricing file | none |
+
+Command:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_investigation_agent.py --provider anthropic --live --answer-format compact --scenario cpu_saturation --seed 601 --max-requests 8 --max-tool-calls 6 --max-total-tokens 30000 --max-output-tokens 1000 --request-timeout 30 --max-seconds 180 --max-retries 0
+```
+
+Result:
+
+| Measure | Value |
+|---------|-------|
+| Status | verified |
+| Verification | verified |
+| Provider requests | 5 |
+| Completed tool calls | 4 |
+| Verified claims | 13 |
+| Read-only checks proposed | 5 |
+| Input tokens | 20,952 |
+| Output tokens | 747 |
+| Total tokens | 21,699 |
+| Latency | about 8.16 seconds |
+| Provider failures | none |
+| Budget stop | none |
+| Cost | unknown, no pricing file |
+
+What this run does not show: accuracy across other scenarios or seeds, repeat-run
+stability, how often a live model's answers are rejected, retention or
+data-handling suitability, or production readiness. The offline evaluation and this
+live run measure different things, and they must not be combined into one accuracy
+claim.
+
+Earlier attempts are recorded under Compact final answer, below. They stopped
+before a verified answer.
+
+Before running it, confirm the preflight passes, both settings are present, the
+model identifier is one you intend to pay for, and the data you would send is
+acceptable (see Cost and usage, below). The run prints the agent run as JSON,
+including its accounting. Record the exit code, status, stop reason, and token counts.
+Do not record the key.
+
+#### Tool calling
+
+The model may request six read-only tools: `list_observations`,
+`get_observation`, `list_hypotheses`, `get_hypothesis`, `list_uncertainties`, and
+`list_suggested_checks`. The trusted registry in `agent_tools.py` defines them, and
+each is bound to one report. No tool takes an incident or run ID.
+
+The Anthropic adapter (`backend/app/services/agent_anthropic_provider.py`) works as
+follows:
+
+1. Each tool is declared with `input_schema`, generated from the Pydantic model that
+   validates its arguments. The final-answer tool, `submit_answer`, uses the
+   `AgentOutput` schema, or the `CompactAgentOutput` schema with
+   `--answer-format compact` (see Compact final answer, below).
+2. A model reply holds `tool_use` blocks, each with an `id`, a `name`, and an
+   `input` object. Parallel tool use is disabled, so a reply normally holds one.
+   Extra blocks in a reply are queued, and no extra request is sent for them.
+3. Each tool request goes back in the conversation as an assistant `tool_use` block
+   with its `id`. Its result follows as a user `tool_result` block with the same
+   `tool_use_id`. A refused request sets `is_error`, and its message never repeats
+   the model's input.
+4. The SDK never executes a tool. Only the trusted dispatcher does, and only for
+   names on the allowlist. An unknown name or invalid arguments are refused.
+5. The final answer is the `submit_answer` input, or plain text. Either way it is
+   parsed in the run's answer format and verified in full.
+
+Stop reasons map as follows. `end_turn`, `tool_use`, and `stop_sequence` are accepted.
+`refusal` ends the run as `refused`. `max_tokens` and `pause_turn` end it as
+`incomplete`. Any other value is `malformed`.
+
+#### Request budgets
+
+Every live provider uses the same budget transport, `agent_transport.py`. Each
+attempt, including a retry, passes the budget check before it is sent. Each attempt
+counts as a request, and its timeout is capped to the time left before the deadline.
+
+| Limit | Default | Hard maximum |
+|-------|---------|--------------|
+| Provider requests, including retries | 8 | 20 |
+| Tool requests, including refused ones | 6 | 20 |
+| Total tokens | 30,000 | 200,000 |
+| Output tokens per response | 1,000 | 4,000 |
+| Timeout per request | 30 s | 120 s |
+| Run deadline | 180 s | 900 s |
+| Automatic retries | 0 | 3 |
+
+#### Compact final answer
+
+The full answer, `AgentOutput`, repeats each claim's reference and event list.
+`--answer-format compact` asks for `CompactAgentOutput` instead. It names records
+by ID and nothing else:
+
+- `observations`: observation IDs (`obs-...`).
+- `hypotheses`: hypothesis kinds.
+- `uncertainties`: missing-evidence and limitation positions, and the ranking caveat.
+- `proposed_checks`: the same check and affected-hypothesis pairs as the full answer.
+
+Trusted code rebuilds the rest. Each observation's event IDs come from the
+report, and each claim's text is filled from the canonical record. The rebuilt
+answer then goes through the same verifier, with the same rules and failure codes,
+as a full answer. An ID the report does not hold is refused, not dropped. So are
+another investigation's ID, a hypothesis the report did not generate, and a
+malformed answer. A compact answer under the full format, or the reverse, is
+malformed.
+
+Measured offline on four synthetic incidents with a fake client, the compact answer
+is 11 to 15 times smaller than the full answer without claim text. Both verify to
+the same claims. These are character counts and estimates, not provider counts, and
+the compact form has not been tested against a live model.
+
+Limitations: missing-evidence entries and limitations have no ID, so the answer
+refers to them by their position in the report. Suggested checks have no ID either,
+so they are identified by check kind and affected hypothesis. A compact observation
+reference always lists every event of its observation, so a model cannot cite a
+subset. See architecture.md section 14.10.
+
+Zero retries is the default, so a first smoke test sends each request once. A local
+timeout does not cancel the request on the server, and the provider may still bill
+it. The input estimate is one token per two characters, which is not a count.
+
+#### Cost and usage
+
+Each run records its model identifier, requests, completed tool calls, input,
+output, and total tokens, end-to-end latency, final status, and stop reason. Cost
+is estimated only from a pricing file you supply, keyed by model identifier, with
+each entry giving its source and verification date:
+
+```json
+{
+  "currency": "USD",
+  "models": {
+    "<model identifier>": {
+      "input_usd_per_million_tokens": "<rate>",
+      "output_usd_per_million_tokens": "<rate>",
+      "source": "<where the rate came from>",
+      "verified_on": "YYYY-MM-DD"
+    }
+  }
+}
+```
+
+For reference, Anthropic's models overview (checked 2026-11-13) lists Claude Sonnet
+5.5 at $2 per million input tokens and $10 per million output tokens. Check the
+pricing page before relying on it. The overview also says Sonnet 5.5 uses adaptive
+thinking by default. This adapter does not set a thinking parameter, so any thinking
+tokens would count toward output usage. Whether that happens has not been verified.
+
+Retention, from Anthropic's API and data retention page (checked 2026-11-13): for
+organizations without a zero data retention (ZDR) agreement, conversation content
+is not retained by default. The exception is models Anthropic calls Covered Models,
+which require 30-day retention. The page lists the Fable and Mythos families as
+Covered Models. It does not list Sonnet 5.5 in the part of the page I read, but that
+should be confirmed with your Anthropic account team before any live use. ZDR is
+enabled per organization through sales. It does not extend automatically to other
+organizations. The page also describes exceptions, such as legal requirements and
+safety flags, which should be read before live use. Retention is governed by the
+provider's terms. This code cannot enforce it.
+
+Sources: [Models overview](https://platform.claude.com/docs/en/models/overview),
+[Pricing](https://platform.claude.com/docs/en/about-claude/pricing), and
+[API and data retention](https://platform.claude.com/docs/en/manage-claude/api-and-data-retention).
+
+#### Verification and safety boundaries
+
+- The model selects records by ID. The server fills each claim's text from the
+  canonical report, so a model cannot add its own sentence by omitting text.
+- If a model does supply text, it must match the canonical text exactly. A paraphrase,
+  an added sentence, or a causal claim is rejected.
+- A single failing claim rejects the whole answer, and no claims are returned.
+- `root_cause_assessment` must be `not_assessed`. Any other value is malformed.
+- Simulator labels are never sent to a model or its tools. A test checks this.
+- Credentials are read from the environment only. They are held as secret values, and
+  they never appear in a log, a prompt, a result, or an error.
+
+#### Limitations and unverified live behaviour
+
+- The OpenAI adapter has not been run against its live API. The Anthropic adapter has
+  one recorded single-case live run (see Live smoke test). No general live validation
+  is claimed.
+- `claude-sonnet-5-5` is confirmed as an API identifier on Anthropic's model overview.
+  It has been used in the one recorded run only. Other scenarios and seeds have not
+  been run live.
+- Strict quoting means a real model may often be rejected. A rejected answer is
+  reported as rejected and is never trimmed.
+- The adaptive-thinking default and its effect on output tokens are unverified.
+- Retention and zero-data-retention eligibility for Sonnet 5.5 need confirmation
+  from your account team before any real telemetry is sent.
+- The SDK preflight passes in this environment. An earlier pytest run of the OpenAI
+  client was blocked by Windows Application Control, and that has not been reproduced.
+- Cost is an estimate from your pricing file, not an invoice.
+
+The agent cannot access ground-truth labels or evaluation data, and a test checks
+that the agent modules never read labels.
 
 ## Configuration
 

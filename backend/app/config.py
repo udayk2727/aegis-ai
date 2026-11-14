@@ -19,6 +19,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SecretStr,
     ValidationError,
     model_validator,
 )
@@ -27,6 +28,9 @@ ENVIRONMENT_VARIABLE = "AEGIS_ENVIRONMENT"
 SIMULATION_API_VARIABLE = "AEGIS_SIMULATION_API_ENABLED"
 TRUSTED_BASELINES_VARIABLE = "AEGIS_TRUSTED_BASELINES_PATH"
 INVESTIGATION_CAP_VARIABLE = "AEGIS_INVESTIGATION_MAX_CITED_EVENTS"
+LIVE_MODEL_VARIABLE = "AEGIS_LLM_MODEL"
+OPENAI_API_KEY_VARIABLE = "OPENAI_API_KEY"
+ANTHROPIC_API_KEY_VARIABLE = "ANTHROPIC_API_KEY"
 
 
 class Environment(StrEnum):
@@ -84,3 +88,44 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
     except ValidationError as error:
         reasons = "; ".join(str(problem["msg"]) for problem in error.errors())
         raise ConfigurationError(f"invalid configuration: {reasons}") from error
+
+
+class LiveModelSettings(BaseModel):
+    """Settings for the optional live model provider, used by local development only.
+
+    Both values come from the environment and neither has a default. The key is
+    held as a ``SecretStr``, so it does not appear in a repr or a dump.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    model: Annotated[
+        str,
+        Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$"),
+    ]
+    api_key: SecretStr
+
+
+def load_live_model_settings(
+    environ: Mapping[str, str],
+    *,
+    key_variable: str = OPENAI_API_KEY_VARIABLE,
+) -> LiveModelSettings:
+    """Build live-provider settings from the environment, failing closed.
+
+    Error text names the variable that is missing or invalid, and never its value,
+    so a bad configuration cannot print a credential. The key variable is a
+    parameter so that each provider reads its own key and the same model setting.
+    """
+    model = environ.get(LIVE_MODEL_VARIABLE, "")
+    api_key = environ.get(key_variable, "")
+    if not model:
+        raise ConfigurationError(f"{LIVE_MODEL_VARIABLE} is not set")
+    if not api_key:
+        raise ConfigurationError(f"{key_variable} is not set")
+    try:
+        return LiveModelSettings(model=model, api_key=SecretStr(api_key))
+    except ValidationError:
+        raise ConfigurationError(
+            f"{LIVE_MODEL_VARIABLE} is not a valid model identifier"
+        ) from None

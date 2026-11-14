@@ -1,0 +1,17 @@
+# Optional: real LLM providers for the investigation agent, local development only.
+# The fake provider needs none of this. Nothing imports an SDK unless the CLI is
+# asked for a live provider with --provider openai|anthropic --live.
+#
+# Each version was chosen by a dry run against the core pins, checking only real
+# changes. A newer release of either SDK pulls in httpx2 and truststore, which
+# are outside the exact pins in requirements.txt, so those releases are not used.
+#   openai 2.54.0: adds only openai, distro, jiter, tqdm, and sniffio.
+#   anthropic 0.109.0: adds only anthropic and docstring-parser.
+# Checked on Python 3.13 for imports and offline tests only. No live request has
+# been made with either SDK.
+#
+# Install after the core requirements:
+#   python -m pip install -r requirements-llm.txt
+
+openai==2.54.0
+anthropic==0.109.0

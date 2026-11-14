@@ -125,6 +125,24 @@ reached through a dependency, so each application instance has its own state.
 No state-changing endpoint is added until the authentication and
 authorization design is accepted.
 
+**Investigation endpoint (as implemented).** `GET /api/v1/incidents/{id}/investigation`
+is read-only and calls no external service, but it has no authentication and no
+runtime guard. `main.py` registers it in every environment, and the environment
+setting does not gate it. In production it returns 403 for any baseline request,
+because trusted baselines cannot be loaded there. That is an indirect effect, not
+a guard. A caller that builds the app with its own `TrustedBaselines` would expose
+the endpoint in production. The endpoint is therefore a local-only operational
+restriction, to be run only on a trusted local machine, until the authentication
+design below is accepted.
+
+**Investigation agent (owner decisions, Phases 1 and 2).** The LLM investigation
+agent has no HTTP endpoint. It runs as a Python library and a local-only CLI. No
+remotely accessible agent endpoint is permitted until an authentication and
+authorization design is documented and approved here. Loopback access is not
+authentication. The optional OpenAI adapter is for local development only. It
+runs only with an explicit `--provider openai --live`, and it needs separate
+authorization for any paid run. Production use is not approved.
+
 **Open gap (as of the simulation engine).** `POST /api/v1/simulations` is
 unauthenticated and local-development-only. It changes server state: it appends
 a run to the in-memory event store, and it can evict other runs. The rule above
@@ -178,7 +196,7 @@ retrieval shape the database adapter will need, not a persistence design.
 | 1     | Configuration, logging, and domain models     | Partial: telemetry models, simulation engine (section 10), analytics (section 11), detectors (section 12) |
 | 2     | Signal ingestion and incident correlation     | Partial: correlation and incident API (section 13); ingestion planned |
 | 3     | Authentication and authorization              | Planned     |
-| 4     | Investigation agents with LLM adapter         | Partial: deterministic rule-based investigation (section 14); LLM adapter planned |
+| 4     | Investigation agents with LLM adapter         | Partial: deterministic investigation (section 14); agent library with a fake provider, an optional OpenAI adapter not yet run live, and an optional Anthropic adapter with one recorded single-case live run (section 14.9) |
 | 5     | Approval workflow and audit log               | Planned     |
 | 6     | Controlled action execution                   | Planned     |
 | 7     | Frontend dashboard and workspace              | Planned     |
@@ -1139,7 +1157,11 @@ Status: **Implemented, read-only, deterministic, offline.** For one incident, th
 investigation separates verified observations from hypotheses, records
 contradictory and missing evidence, and suggests read-only checks. It calls no
 language model, writes no state, and sends no telemetry anywhere. Usage is in the
-[README](../README.md#investigation).
+[README](../README.md#investigation). The LLM investigation agent (section 14.9) is a
+separate, optional layer over these reports. Its default provider makes no network
+call. An optional OpenAI adapter exists for local development only, and it has not
+been run against the live API. An optional Anthropic adapter has one recorded
+single-case live run (section 14.9).
 
 ### 14.1 Components
 
@@ -1155,6 +1177,13 @@ language model, writes no state, and sends no telemetry anywhere. Usage is in th
 | `app/routers/incident_access.py` | Baseline trust and store snapshot, shared with the incident endpoints | Never read |
 | `app/routers/investigations.py` | `GET /api/v1/incidents/{incident_id}/investigation` | Never read |
 | `app/services/investigation_provenance.py` | Provenance checks, run by the API before a report is returned | Never read |
+| `app/domain/agent_records.py` | Agent contracts: claims, evidence references, tool requests, verification status | Never read |
+| `app/services/agent_tools.py` | Allowlisted read-only tools over one report, and canonical record text | Never read |
+| `app/services/agent_verification.py` | Deterministic verifier against the canonical report | Never read |
+| `app/services/agent_orchestration.py` | Bounded tool-calling loop | Never read |
+| `app/services/agent_provider.py`, `agent_fake_provider.py` | Provider interface, and the deterministic fake provider | Never read |
+| `app/services/agent_openai_provider.py` | Optional OpenAI Responses adapter, local development only | Never read |
+| `app/services/agent_budget.py` | Run budgets, token reserve, pricing file, and cost estimate | Never read |
 
 The label-isolation test (`test_label_isolation.py`) covers every module above
 except the evaluator. It fails on any label read or label import, and it fails if
@@ -1334,7 +1363,7 @@ Output of `scripts/evaluate_investigations.py`, 50 runs (10 per scenario):
 - **Single incident.** Each report is computed from one incident. No reasoning
   spans incidents.
 - **No persistence.** Reports are recomputed per request from the in-memory store,
-  as in section 13.10. Development-only, like the incident endpoints (section 5).
+  as in section 13.10. No runtime guard limits it to development. Section 5 records the exposure.
 - **Recomputation cost.** Each request fits the detector twice, once for the
   incident and once for the verdicts, and scores the whole store. The store is
   capped at 50,000 events, but the cost is not bounded beyond that. The cited-event
@@ -1344,16 +1373,483 @@ Output of `scripts/evaluate_investigations.py`, 50 runs (10 per scenario):
   the flag say so, but the report does not list the rest. There is no endpoint that
   lists them, so a reader cannot verify beyond the listed IDs through the API.
 
-### 14.9 Future LLM agent integration (planned, not implemented)
+### 14.9 LLM investigation agent (fake and optional live provider)
 
-No model call exists in this code, and no provider adapter does either. The
-intended design, which needs its own approval and an authentication design under
-section 5, is:
+Status: **implemented as a Python library and a local-only CLI.** Three providers
+exist. The default `fake` provider makes no network call. The `openai` and
+`anthropic` providers are optional, for local development only, and each runs only
+with `--provider <name> --live`. **The OpenAI adapter has not been run against its
+live API. The Anthropic adapter has one recorded single-case live run that completed
+and verified** (section 14.9, "Recorded live validation"). That run is not evidence of
+general accuracy, and the tests use simulated responses. Behaviour with a real model
+is otherwise unverified. There is no HTTP endpoint.
 
-- An agent may write narrative text from a report. It must cite the report's
-  observation IDs and event IDs, and the provenance check then applies to its
-  output.
-- Model output stays untrusted (section 5, rule 9). It is validated against the
-  report before it is shown, and it never supplies a command, query, or URL.
-- An agent may propose further read-only checks. It may not run them against a
-  live system without the approval gate in section 2.
+**Approvals.** Phase 1 covered a local, read-only agent over synthetic evidence.
+Phase 2 covered an optional OpenAI adapter for local development. Phase 3 covered
+offline hardening, budgets, accounting, a preflight, and an offline evaluation. Phase
+4A covered an optional Anthropic adapter for local development. The Day 7 exception
+in `CLAUDE.md` records that scope, including the two pinned SDKs. It does not cover
+production use, any endpoint, any change to authentication, paid requests without a
+separate authorization for each, remediation, or any other provider.
+
+**Decisions.**
+
+- Days 1 to 6 are unchanged. The detectors, ranking, investigation schema, baseline
+  trust, and provenance checks were not modified.
+- The model only requests tools. Only the trusted, allowlisted, read-only registry
+  runs them, and each tool is bound to one report.
+- The model selects records by ID. The server supplies the canonical sentence.
+- Every model output, from any provider, goes through the same deterministic verifier.
+  A failed answer is rejected in full, never trimmed.
+- Agent modules never read ground-truth labels or evaluation data.
+
+**Provider architecture.**
+
+| Component | Module | Role |
+|-----------|--------|------|
+| Provider interface | `services/agent_provider.py` | `ModelProvider`, and `ProviderError` with a fixed reason and any reported usage |
+| Budgets and accounting | `services/agent_budget.py` | `RunBudget`, the token reserve, the pricing file, and cost estimates |
+| Shared transport | `services/agent_transport.py` | The budgeted send loop used by every live adapter |
+| Fake provider | `services/agent_fake_provider.py` | Scripted replies for tests, and the reference answer for the CLI |
+| OpenAI adapter | `services/agent_openai_provider.py` | Responses API. The only module that imports the OpenAI SDK |
+| Anthropic adapter | `services/agent_anthropic_provider.py` | Messages API. The only module that imports the Anthropic SDK |
+| Loop | `services/agent_orchestration.py` | Budget checks, dispatch, verification, and status mapping |
+| Compact answer | `services/agent_compact.py` | Rebuilds the full answer from a compact, ID-only answer (section 14.10) |
+| Preflight | `scripts/check_llm_environment.py` | Checks both SDKs without sending a request |
+| Evaluation | `scripts/evaluate_agent.py` | Offline fake-provider evaluation, and a gated live mode |
+
+Each adapter is loaded only when its flags are given. Importing the application
+loads neither SDK. A test checks this in a separate process.
+
+**Shared request-budget transport.** `send_within_budget` sends every live request.
+Each adapter supplies two things: a function that sends one request, and a function
+that classifies its errors as a fixed reason and as transient or not. The transport
+does the rest. For each attempt, including a retry, it checks the request count, the
+deadline, and the token reserve before anything is sent. It takes the timeout from
+the time left before the deadline, and it refuses to send if no time is left. It
+counts every attempt as a request, and it retries only if the retry limit allows,
+the error is transient, and the backoff still ends before the deadline. Usage from
+each reply is added after it arrives. Because both adapters use one transport, the
+budget rules are the same for each.
+
+| Limit | Default | Hard maximum | Checked |
+|-------|---------|--------------|---------|
+| Provider requests, including retries | 8 | 20 | before every request |
+| Tool requests, including refused ones | 6 | 20 | before every tool request |
+| Total tokens | 30,000 | 200,000 | before each call, and after each reply |
+| Output tokens per response | 1,000 | 4,000 | sent as the response limit |
+| Timeout per request | 30 s | 120 s | per request, capped to the time left |
+| Run deadline | 180 s | 900 s | before each call, and after each reply |
+| Automatic retries | 0 | 3 | only if the retry limit allows |
+
+The token reserve is an estimate: one token per two characters of the serialized
+request, plus the output allowance. A request whose reserve would pass the token
+limit is not sent. The estimate overestimates ordinary English. It is not a count,
+and it does not guarantee that a request stays within budget. A local timeout does
+not cancel the request on the server, and the provider may still bill it. A request
+in flight can run past the deadline by at most one timeout.
+
+**Configuration.** These come from the environment only:
+
+| Variable | Required for | Notes |
+|----------|--------------|-------|
+| `ANTHROPIC_API_KEY` | `anthropic` | Held as a `SecretStr`. Never logged, printed, or put in a prompt |
+| `OPENAI_API_KEY` | `openai` | Held as a `SecretStr`. Never logged, printed, or put in a prompt |
+| `AEGIS_LLM_MODEL` | both live providers | No default. Must match a restricted identifier pattern |
+
+`load_live_model_settings` in `config.py` fails closed. Its errors name the variable
+that is missing or invalid, and never a value. The key variable is a parameter, so
+each provider reads its own key. Pricing is not an environment setting. It comes
+from a file the operator names with `--pricing-file`.
+
+**Anthropic tool-calling workflow.**
+
+1. The loop sends fixed instructions and the investigation ID. The transcript holds
+   no report narrative.
+2. The adapter sends a stateless request. The `system` field holds only the trusted
+   instructions. Each user turn is a user message. Each earlier tool request is an
+   assistant message with a `tool_use` block, carrying its `id`, `name`, and `input`.
+   Each result is a user message with a `tool_result` block, carrying the same
+   `tool_use_id`, and `is_error` set when the tool request was refused. The request
+   carries `tool_choice` with `disable_parallel_tool_use` set. Tools are declared
+   with `input_schema`, and the answer tool is `submit_answer`. The wire schema
+   omits `minLength`, `maxLength`, and `maxItems`, which the API documents as
+   unsupported. Pydantic still enforces those limits on every answer.
+3. The adapter parses the reply by stop reason, as listed under Failure states. Each
+   `tool_use` block becomes a turn. The first is returned, and the rest are queued,
+   so no extra request is sent for them. Text becomes a final answer. More than 8
+   tool-use blocks in one reply is malformed.
+4. The loop checks its limits, then dispatches each tool request through the trusted
+   registry. The SDK never runs a function. Invalid input produces a fixed refusal,
+   returned with the same `tool_use_id`.
+5. A `submit_answer` block, or a plain-text answer, is parsed in the run's answer
+   format, `AgentOutput` by default or `CompactAgentOutput` (section 14.10). It is
+   then verified. If it passes, each claim's canonical text is filled from the
+   report.
+
+**Anthropic thinking-block replay.** When the model thinks before a tool request, its
+reply carries `thinking` or `redacted_thinking` blocks with signatures. The API requires
+each tool round to send those blocks back unchanged, so the adapter does the following.
+
+- It stores the reply's content blocks in order, in `ProviderTurn.replay_blocks`, and
+  copies them to the transcript message for that tool request. Only the fields the API
+  accepts are kept: `thinking` and `signature`, `data`, `text`, and `id`, `name`, and
+  `input`. A block of any other type, or a thinking block without a string signature,
+  is malformed.
+- On replay, it sends the stored blocks in their original order, followed by the tool
+  result. It checks that the stored `tool_use` block matches the recorded request
+  (ID, name, and input) before sending anything. A mismatch is refused without a request.
+- A reply with several tool requests and any thinking block is malformed, because the
+  blocks cannot be replayed in order for each request. Without thinking blocks, the
+  existing queue behaviour is unchanged.
+- The system text and tool definitions are the same on every request. Thinking blocks
+  never reach logs, results, or the CLI, and `replay_blocks` is excluded from `repr`.
+- The request does not set `thinking`, so the model's default applies. Thinking tokens
+  count against `max_output_tokens`, so a long thinking turn can stop with `max_tokens`.
+  That is reported as `INCOMPLETE`. The budget is unchanged.
+
+**OpenAI tool-calling workflow.** The OpenAI adapter follows the same pattern with the
+Responses API. Each request is stateless, with `store` set to false. Calls are
+`function_call` items, and results are `function_call_output` items with the same
+`call_id`. Parallel calls are disabled. The final answer is `submit_answer`. The
+store setting was set in code, and it has not been re-checked against OpenAI's
+current documentation in this phase.
+
+**Evidence and verification boundaries.** Every answer, from any provider, goes
+through the rules in section 14.9 of Phase 1: kind, reference, canonical text, cited
+events, proposed checks, caveat, insufficient evidence, and report provenance. Two rules
+matter most for a live model:
+
+- Claim text is optional. When it is left out, the server supplies the canonical
+  sentence. When text is given, it must match exactly.
+- `root_cause_assessment` must equal `not_assessed`. Any other value is malformed.
+
+The three groups stay separate: `observation` for verified observations,
+`hypothesis` for existing unconfirmed candidates, and `uncertainty` for missing
+evidence, limitations, and the ranking caveat.
+
+**Failure states.** Each failure has a fixed reason and carries no provider text.
+
+| Reason | Status | Retried |
+|--------|--------|---------|
+| `refused` (`refusal` stop reason, or a refusal item) | `refused` | no |
+| `incomplete` (`max_tokens` or `pause_turn`) | `incomplete` | no |
+| `malformed` (unknown stop reason, or unusable content) | `malformed_output` | no |
+| `timeout` | `provider_error` | yes, if the retry limit allows |
+| `network` | `provider_error` | yes, if the retry limit allows |
+| `rate_limited` (HTTP 429) | `provider_error` | yes, if the retry limit allows |
+| `server_error` (HTTP 5xx) | `provider_error` | yes, if the retry limit allows |
+| `invalid_request` (HTTP 400, 422) | `provider_error` | no |
+| `authentication` (HTTP 401) | `provider_error` | no |
+| `permission` (HTTP 403) | `provider_error` | no |
+| `not_found` (HTTP 404) | `provider_error` | no |
+| `api_error` (any other HTTP status, or an unrecognised exception) | `provider_error` | no |
+| `budget` (a limit stopped the request) | `budget_exhausted` | no |
+
+**Provider error classification.** The first authorized live attempt returned
+`provider_error` with reason `api_error`, one request, and no tokens. The old
+classification discarded the HTTP status, so the cause could not be identified. The
+classification above was added so that a failed run records the status it received.
+The adapter maps the Anthropic SDK's exceptions, and the shared transport applies the
+retry rules.
+
+- **Order.** Timeouts are checked first, then connection failures, then HTTP status
+  errors. Only the status code and the request ID are kept from a status error. The
+  SDK's message and response body are never read into a result.
+- **Sanitized status.** A run records `provider_http_status`, an integer from 100 to
+  599, when the provider returned an HTTP response. It is absent for timeouts,
+  connection failures, budget stops, and local errors.
+- **Request ID.** A run records `provider_request_id` only when the value from the
+  response header matches `^[A-Za-z0-9_-]{1,128}$`. Any other value is dropped, not
+  truncated or cleaned. The identifier is only in the run result. It is not logged,
+  not sent to a model, and not returned by any HTTP endpoint.
+- **Retry restrictions.** Only timeouts, connection failures, 429, and 5xx are
+  retried. A retry needs the retry limit, the request count, the token reserve, and the
+  deadline to allow it. The SDK's own retries are off, so 400, 401, 403, 404, 422, and
+  any other unlisted status are sent once. The default retry limit is 0.
+- **Fail closed.** A provider failure ends the run with status `provider_error` and
+  verification `not_verified`. `AgentRun` rejects any claim or proposed check on an
+  unverified run. The CLI exits with code 2. The loop does not fall back to another
+  provider, and it does not return a partial answer from a malformed reply.
+- **Scope.** The OpenAI adapter uses the same transport and the same retry rules. Its
+  classifier does not yet record the HTTP status or request ID, and its 4xx responses
+  stay `api_error`. Those reasons apply to the Anthropic adapter only.
+
+Anything the classifier does not recognise is `api_error` and is not retried. The
+message is dropped, because an SDK message can echo request details.
+
+**Cost and usage accounting.** Each run returns a `RunAccounting` record with the
+model identifier, provider requests, completed tool calls, input, output, and total
+tokens, end-to-end latency, final status, and any stop reason. Cost is estimated only
+from the operator's pricing file, keyed by model identifier, with each entry recording
+its source and verification date. No rate is built into the code. A run without a
+price for its model reports cost as unknown, never as zero.
+
+**Security controls.**
+
+- No credential appears in a repr, a dump, a log, a prompt, or an error. Tests check
+  this with a sentinel that the SDK echoes back.
+- Each SDK's own retries are off, so the budgeted transport is the only retry path.
+- Tool output and telemetry reach the model only as data in tool results. They never
+  enter the system text, which holds only the trusted instructions.
+- A refused tool request never echoes the model's name or input.
+- A provider's output is never executed, and it cannot bypass verification.
+
+**Retention and data egress.** Each request carries the report's canonical statements
+and identifiers as tool-result data. In this phase they come from simulated telemetry.
+Real telemetry must not be sent without a separate data-handling decision. Anthropic's
+API and data retention page (checked 2026-11-13) says that, for organizations without a
+zero data retention (ZDR) agreement, conversation content is not retained by default,
+except for Covered Models, which require 30-day retention. The page names the Fable and
+Mythos families as Covered Models. It does not name Sonnet 5.5 in the part of the page
+read for this check, but that must be confirmed with the account team before any live
+use. ZDR is enabled per organization through sales. Retention is governed by the
+provider's terms, and this code cannot enforce it.
+
+**Model and pricing facts (checked 2026-11-13).** Anthropic's models overview lists
+`claude-sonnet-5-5` as the Claude API ID for Sonnet 5.5, with 1M-token context, 128K
+maximum output, and a base price of $2 per million input tokens and $10 per million
+output tokens. The overview says Sonnet 5.5 uses adaptive thinking by default. This
+adapter sets no thinking parameter, so whether thinking tokens are billed as output has
+not been verified. Sources:
+[Models overview](https://platform.claude.com/docs/en/models/overview),
+[Pricing](https://platform.claude.com/docs/en/about-claude/pricing), and
+[API and data retention](https://platform.claude.com/docs/en/manage-claude/api-and-data-retention).
+
+**SDK pins and compatibility.** `requirements-llm.txt` pins `openai==2.54.0` and
+`anthropic==0.109.0`. Each was chosen by a dry run that reported only real changes.
+Newer releases of either SDK pull in `httpx2` and `truststore`, which are outside the
+core pins, so they were not used. The earlier claim that the OpenAI 3.x release
+upgrades `pydantic` came from a dry run that listed every package. Only the `httpx2`
+conflict is real. `pip check` is clean with both SDKs installed, and the core pins are
+unchanged.
+
+**SDK preflight.** `scripts/check_llm_environment.py` checks each SDK's Python version,
+installed version against its pin, import, client construction with a dummy key, and
+resource loading. It sends no request. In this environment every check passes for both
+SDKs. A pass shows the SDK loads here. It does not show that a live adapter works.
+
+An earlier pytest run of the OpenAI client was blocked by Windows Application Control.
+That failure has not been reproduced. Whether the policy applies to every process on
+this machine is not verified. No security policy was changed or bypassed. If the block
+returns, the authorized options are an approved development host, or an environment
+whose security owner has approved the SDK.
+
+**Offline tests.** `test_agent_openai_provider.py` and `test_agent_anthropic_provider.py`
+drive each adapter with simulated responses and fake clients. They make no request. They
+cover tool round trips, identifier correlation, multiple tool requests, invalid and
+unauthorized tools, malformed output, fabricated IDs, cross-incident answers, injection,
+refusal, incomplete output, timeouts, rate limits, each HTTP status category, retry
+exhaustion, request-ID handling, configuration errors, token accounting, budget
+exhaustion, credential handling, and the absence of
+accidental imports or requests. `test_agent_budget.py` covers limit bounds, zero retries
+by default, request-budget exhaustion across retries, deadline exhaustion before a
+request, timeouts capped to the deadline, the token reserve, overruns, pricing, and unknown
+cost. `test_agent_preflight.py` uses stand-ins. `test_agent_evaluation.py` checks that
+every faulty answer is rejected, that the model never receives labels, and that live
+mode is refused without its flags.
+
+**Offline evaluation.** `scripts/evaluate_agent.py` runs the fake provider over four
+synthetic scenarios and three seeds each. For each scenario it runs the faithful answer,
+14 faulty answers, a bad tool request, a timeout, a refusal, and an exhausted tool
+budget. Token counts are estimates, and cost is unknown. The measures are
+structured-output validity, faulty answers rejected and accepted, statements accepted
+that the report does not contain, tool successes and rejections, provider failures,
+budget stops, estimated tokens, and latency. The accepted counts must be zero. Scenario
+agreement is a label check. It is not evidence of causal accuracy. The default result is
+228 cases, 168 faulty answers all rejected, none accepted, 228 of 228 expectations met,
+and 12 of 12 scenario agreements. These results cover the simulator's fault types with
+the fake provider. They say nothing about a real model.
+
+**Live evaluation and live smoke test.** The evaluation script's live mode requires
+`--provider openai|anthropic` and `--live`. It runs the reference case through the live
+provider, capped by `--max-live-cases`, which defaults to one and is bounded to 12. The
+single-run CLI is `scripts/run_investigation_agent.py`. The live mode of the evaluation
+script has not been run against a live API, and the OpenAI provider has not been run
+live at all. Pytest, CI, imports, and default evaluation never run them.
+
+**Recorded live validation (Anthropic, one synthetic case, 2026-11-13).** One live
+investigation completed and verified. It is one synthetic case. It is not evidence of
+general causal accuracy, and it is not evidence of production readiness.
+
+Configuration, as run:
+
+- Provider: `anthropic` (Anthropic Messages API), with `--live`
+- Model: `claude-sonnet-5-5` (Claude Sonnet 5.5)
+- Answer format: `compact`
+- Scenario and seed: `cpu_saturation`, seed 601
+- Budget: 8 requests, 6 tool calls, 30,000 total tokens, 1,000 output tokens, 30 s
+  per request (the default), 180 s deadline, 0 retries
+- Pricing file: none
+
+Result:
+
+- Status: verified. Verification: verified
+- Provider requests: 5. Completed tool calls: 4. Verified claims: 13. Read-only checks
+  proposed: 5
+- Tokens: 20,952 input, 747 output, 21,699 total. Latency: about 8.16 seconds
+- Provider failures: none. Budget stop: none. Cost: unknown, no pricing file
+
+The command is `scriptsun_investigation_agent.py --provider anthropic --live
+--answer-format compact --scenario cpu_saturation --seed 601 --max-requests 8
+--max-tool-calls 6 --max-total-tokens 30000 --max-output-tokens 1000
+--request-timeout 30 --max-seconds 180 --max-retries 0`.
+
+What this does not show: accuracy across other scenarios or seeds, repeat-run
+stability, how often real answers are rejected, retention or data-handling suitability,
+or production readiness. The offline evaluation (228 fake-provider cases) and this
+single live run measure different things and must not be combined into one accuracy
+claim.
+
+**Authorization for any further Anthropic run.** Each further run is paid and needs all
+of the following:
+
+- Owner authorization for that specific run, because it makes paid requests.
+- A passing preflight in the environment that will run it.
+- `ANTHROPIC_API_KEY` and `AEGIS_LLM_MODEL` set in the environment, from the owner's
+  secret store, with the model identifier the owner has chosen.
+- Confirmation that the data to be sent is acceptable, and confirmation of retention
+  terms for the chosen model.
+- A pricing file, if a cost estimate is wanted. Without one, cost is reported as unknown.
+
+Example command, which must not be run without that authorization:
+
+    python scripts\run_investigation_agent.py --provider anthropic --live --scenario cpu_saturation --seed 601 --max-requests 4 --max-total-tokens 20000 --max-seconds 120 --max-retries 0
+
+The run should record the exit code, status, failure reason or budget stop, accounting
+record, and cost basis. It must not record the key.
+
+**Anthropic connectivity diagnostic (run once, 2026-11-13).** Before the agent run,
+`scripts/anthropic_connectivity_check.py` sends one synthetic message, "Reply with OK.",
+with no tools, no system text, no thinking settings, and no investigation data. It
+allows 16 output tokens and disables SDK retries. Without `--live` it checks the model
+setting, the request shape, and the SDK client offline, and sends nothing. With `--live`
+it sends one request. A failure reports the HTTP status, a sanitized request ID, and a
+category from a fixed list. It never prints the key, the request body, response headers,
+or the SDK's error message. It does not test tool calling, thinking-block replay, or
+evidence verification. Those need the agent CLI above.
+
+Command for one authorized request, as run:
+
+    python scripts\anthropic_connectivity_check.py --live
+
+The run completed successfully: model `claude-sonnet-5-5`, result `ok`, stop reason
+`end_turn`, 15 input tokens, 5 output tokens. It used no investigation tools, so it
+tests only that the SDK, key, and model identifier work. It is separate from the
+investigation run recorded in section 14.9.
+
+**Known limitations.**
+
+- Live validation is limited to one Anthropic single-case run. The OpenAI adapter has
+  not been validated against its API. How a real model behaves across scenarios and
+  seeds, including how often its answers are rejected, is unknown.
+- Strict canonical quoting may reject many real answers. A rejected answer is reported as
+  rejected, never trimmed. Narrative text needs its own verification design.
+- `claude-sonnet-5-5` is confirmed as an identifier on the models overview. It was used
+  in the one recorded run. The installed SDK's list does not include it, though the SDK
+  passes unknown identifiers through unchanged.
+- The HTTP status of the first live attempt is unknown. That run predates the
+  classification above, so its status was never recorded.
+- The adaptive-thinking default and its effect on output tokens are unverified.
+- Cost is an estimate from the operator's pricing file, not a provider invoice.
+- A retry can repeat a request the provider already processed, and each attempt is
+  billed.
+- The deadline can be overrun by one in-flight request.
+- Tool outputs and report statements are sent to the provider as data. Real telemetry
+  must not be sent without a separate data-handling decision.
+- The SDK preflight passes here, but an earlier pytest run of the OpenAI client was
+  blocked by Windows Application Control. That has not been reproduced.
+
+**Production authentication and exposure gap.** None of this is production-ready. The
+investigation and incident endpoints, and the simulation API, have no authentication. The
+agent has no endpoint. Any future endpoint needs the authentication design in section 5
+first. The live adapters are for local development only, and production use needs a
+separate approval.
+
+**Not in this phase.** Production use, any HTTP endpoint, any change to authentication,
+streaming, prompt caching, additional providers, free-form narrative, autonomous
+remediation, and any paid request.
+
+**Phase 1 notes preserved.** The fake provider makes no request, and its reference
+answer is written from the report. Passing it shows that the verifier accepts a faithful
+answer, and that the loop works. It does not show the behaviour of a real model.
+
+### 14.10 Compact final answer (optional, local development only)
+
+**Why.** A full answer repeats each claim's reference, including every event ID of its
+observation. On the synthetic incidents, that answer was 18,700 to 21,800 characters
+without claim text. The 1,000-token output cap is far below that, so a faithful full
+answer could be cut off and reported as incomplete. The compact answer is designed to
+fit within the cap.
+
+**Contract.** `CompactAgentOutput` has six fields: `investigation_id`,
+`root_cause_assessment` (fixed to `not_assessed`), `observations`, `hypotheses`,
+`uncertainties`, and `proposed_checks`. Each list keeps its kind, so an observation, an
+unconfirmed hypothesis, and an unknown stay distinct. `uncertainties` accepts only
+missing-evidence, limitation, and ranking-caveat sources. The model never sends text,
+event IDs, or a reference per claim. Extra fields are refused.
+
+**Stable references.** The compact form relies only on identifiers the report already
+holds:
+
+| Record | Reference in a compact answer | Stability |
+|--------|-------------------------------|-----------|
+| Verified observation | `observation_id` (`obs-...`) | Stable within the report |
+| Hypothesis | `HypothesisKind` | Stable. Each generated kind is named by its kind |
+| Missing evidence | Position in the report | Positional only. The record has no ID |
+| Limitation | Position in the report | Positional only. The record has no ID |
+| Ranking caveat | Fixed ID `ranking_caveat` | Stable |
+| Suggested check | Pair of `CheckKind` and affected hypotheses | No record ID. Identified by the pair |
+
+No identifier was invented for the positional records or the checks. Positions match
+the keys the existing verifier and tools already use.
+
+**Expansion.** `expand_compact` builds an `AgentOutput` from trusted fields only. An
+observation's events come from the report's `source_event_ids`. A hypothesis or
+uncertainty takes its kind from the list it appears in. Each reference carries the
+answer's investigation ID. Text is left unset, so the server fills it from the canonical
+record after the answer is accepted. An unknown ID keeps its name and gets no events. The
+verifier then rejects it. Expansion refuses nothing itself, and every refusal is one the
+existing verifier makes.
+
+**Verification guarantees.** The expanded answer is passed to the unchanged
+`verify_output`, and the same `hydrate_claims` fills the text. The existing rules apply
+without change: kind and source, canonical text, cited events against the source run,
+suggested checks, ranking caveat, insufficient evidence, and report provenance. Each
+case has a test. Unknown, other-incident, and ungenerated IDs are rejected. An answer
+naming another investigation is rejected before any claim is checked. Malformed JSON,
+extra fields, non-ID strings, a wrong source in `uncertainties`, and more references
+than the limit are malformed. A format mismatch is malformed in both directions.
+
+**Format selection.** `run_agent` takes an `answer_format`, which defaults to `full`.
+The provider takes the same value, and it sets the answer tool's schema and the system
+note. The CLI passes one value to both. The full path is unchanged, and it is still the
+default, so the existing fake provider and tests behave as before.
+
+**Measurements (estimates, offline, fake client).** On the CPU-saturation fixture, with
+the same three-tool sequence:
+
+| Measure | Full | Compact |
+|---------|------|---------|
+| Submit schema, characters | 3,609 | 2,606 |
+| Final answer without claim text, characters | 18,736 | 1,404 |
+| Final answer, estimated tokens (chars / 2) | 9,368 | 702 |
+| Fourth-request estimate, tokens | 7,265 | 6,793 |
+
+With the recorded live total of 12,331 tokens already used, the fourth request was
+refused at 20,000 tokens for the full answer. For the compact answer it would still be
+refused at 20,000 with the 1,000-token reserve, but it fits at 30,000. These numbers come
+from a synthetic transcript and an estimator. They are not live token counts.
+
+**Limitations.**
+
+- The compact form has not been run against a live model, so whether a model names
+  records correctly, and how often its answers are refused, is unknown.
+- Positional references to missing evidence and limitations depend on the report's
+  stored order. A report with a different order gives different positions.
+- A compact observation reference cites every event of the observation. The full form
+  allowed a subset, so the compact form is stricter, but it cannot express a narrower
+  citation.
+- The estimator counts characters, so the savings are estimates, not provider counts.
+- Suggested checks are identified by the pair of kind and affected hypotheses. Two
+  checks with the same pair would be indistinguishable.
