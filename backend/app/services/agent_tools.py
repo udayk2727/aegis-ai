@@ -32,6 +32,9 @@ from app.domain.investigation_records import (
 RecordKey = tuple[RecordSource, str]
 
 RANKING_CAVEAT_ID = "ranking_caveat"
+ERROR_UNKNOWN_TOOL = "unknown tool"
+ERROR_INVALID_ARGUMENTS = "invalid arguments"
+ERROR_NO_RECORD = "no matching record in this investigation"
 UNCERTAINTY_SOURCES = CLAIM_SOURCES[ClaimKind.UNCERTAINTY]
 
 
@@ -198,17 +201,13 @@ def dispatch(report: Investigation, call: ToolCall) -> ToolResult:
     """
     spec = REGISTRY.get(call.name)
     if spec is None:
-        return ToolResult(ok=False, error="unknown tool")
+        return ToolResult(ok=False, error=ERROR_UNKNOWN_TOOL)
     try:
         args = spec.arguments.model_validate(call.arguments)
     except ValidationError:
-        return ToolResult(ok=False, tool=spec.name, error="invalid arguments")
+        return ToolResult(ok=False, tool=spec.name, error=ERROR_INVALID_ARGUMENTS)
     try:
         data = spec.run(report, args)
     except LookupError:
-        return ToolResult(
-            ok=False,
-            tool=spec.name,
-            error="no matching record in this investigation",
-        )
+        return ToolResult(ok=False, tool=spec.name, error=ERROR_NO_RECORD)
     return ToolResult(ok=True, tool=spec.name, data=data)

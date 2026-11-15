@@ -1853,3 +1853,81 @@ from a synthetic transcript and an estimator. They are not live token counts.
 - The estimator counts characters, so the savings are estimates, not provider counts.
 - Suggested checks are identified by the pair of kind and affected hypotheses. Two
   checks with the same pair would be indistinguishable.
+
+### 14.11 Day 8: evaluation matrix, provider turns, and lifecycle trace
+
+Status: **implemented, offline only.** The fake provider is the default and the only
+provider used here. No live request was made for this section, and no new endpoint,
+dependency, or paid path was added.
+
+**Scope.** Day 8 measures verified completion and explains controlled failures from
+an ordered trace. It changes no verifier decision, budget limit, tool scope, or
+existing result field. The one addition to default output is the `provider_turns`
+key on `AgentRun`.
+
+**Provider turns.** `AgentRun.provider_turns` counts each provider invocation the
+orchestrator attempts, including one that raises. A stop before an invocation is not
+counted. It is separate from `provider_requests`, which counts requests the transport
+admitted and sent. A fake run can have `provider_turns > 0` and `provider_requests == 0`.
+The fake path does not call the transport, and no admission record is fabricated for it.
+
+**Lifecycle trace.** `AgentRun.trace` is an ordered tuple of `TraceEvent` values,
+bounded at 128 events. Each event carries:
+
+| Field | Meaning |
+|-------|---------|
+| `sequence` | 1-based position within the run |
+| `kind` | `provider_turn`, `admission`, `tool_outcome`, `verification`, `provider_failure`, `budget_stop`, or `terminal` |
+| `outcome` | A fixed category for that kind (for example `invoked`, `ok`, `refused_unknown_tool`, `rejected`, `timeout`, `tokens`, `provider_error`) |
+| `elapsed_ms` | Milliseconds from the first reading of a trace clock. It is null when no trace clock is given |
+| `tool` | An allowlisted tool name, or null. It is never set for an unknown tool |
+| `failure_codes` | The distinct verifier failure codes, in first-seen order, on a `verification` event only |
+
+The trace is recorded where each step happens, by `app/services/agent_trace.py`.
+Every run ends with exactly one `terminal` event, which is the last event. A budget
+stop is recorded just before it. A trace has no prompt, transcript, tool argument or
+result, telemetry, claim text, replay block, or raw error text.
+
+**Timing without a second clock.** The trace takes its own optional clock, separate
+from the budget's. The budget's clock governs the deadline, and tests script it
+exactly. A run without a trace clock reads no extra time and leaves `elapsed_ms`
+null. The evaluator passes a monotonic performance counter.
+
+**Export.** The trace is excluded from `AgentRun` JSON by default. The evaluator's
+`--json --trace` adds the traces of its offline cases. `--trace` without `--json`, or
+with a live provider, is refused with exit code 3.
+
+**Evaluation matrix.** `scripts/evaluate_agent.py` runs 240 cases: four scenarios,
+seeds 601 to 603, and 20 cases per scenario-seed pair. The cases are split by design,
+not by outcome:
+
+- *Verified completion* (24 cases): the reference answer, and the reference after
+  refused tool requests. Met when the status is `verified`.
+- *Expected failure handling* (216 cases): 168 faulty answers, 12 budget
+  exhaustions, 12 timeouts, 12 refusals, and 12 provider failures after one
+  successful tool call. Met when the status is the expected stop or rejection, with
+  no claims. The mid-run case also requires exactly one retained tool success.
+
+Unsafe acceptance is reported separately, and it must be zero. It counts faulty
+answers that verify (`attacks_accepted`) and verified claims whose text is not
+canonical (`novel_statements_accepted`).
+
+**Offline result, 2026-11-15, fake provider, seeds 601 to 603.** Verified completion
+24/24. Expected failure handling 216/216. Faulty answers rejected 168/168, accepted 0.
+Novel statements accepted 0. Provider turns 1056. Transport requests 0. Trace events
+2352. Scenario agreement 12/12, a label check and not causal accuracy. Tokens are
+estimates, 3,382,185 in total, one per two characters. Cost is unknown. Mean latency
+was under 1 ms per case across the two recorded runs, and it varies. Two runs gave
+identical outcomes, counts, and event order. Only the latency and the `elapsed_ms`
+values differed.
+
+**Limitations.**
+
+- The fake provider is deterministic and scripted. Its results say nothing about how a
+  live model behaves, and the mid-run failure is an injected stop, not a fault observed
+  in a real provider.
+- Tokens are estimates. The offline run has no price, so its cost is unknown.
+- Trace timing is local and varies between runs.
+- The live path does not export traces. Transport admissions appear in the trace only
+  where the live transport records them, and no live run has been traced.
+- Traces are not stored. A caller that needs them must keep them.

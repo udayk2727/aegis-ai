@@ -1202,6 +1202,56 @@ The preflight checks both SDKs: the Python version, the installed version agains
 the pin, the import, client construction with a dummy key, and the resource. It sends
 no request. A pass means the SDK loads here. It does not mean a live adapter works.
 
+#### Offline evaluation matrix and lifecycle trace (Day 8)
+
+The offline evaluation runs 240 cases over four synthetic scenarios and seeds 601,
+602, and 603, with the fake provider only. Its 240 cases are split into two groups
+with separate denominators:
+
+| Group | Cases | Meaning | Met |
+|-------|-------|---------|-----|
+| Verified completion | 24 | Built to verify: the reference answer, and the reference after refused tool requests | 24/24 |
+| Expected failure handling | 216 | Built to stop or reject safely: 168 faulty answers, 12 budget stops, 12 timeouts, 12 refusals, 12 failures after a successful tool call | 216/216 |
+
+Metric definitions:
+
+- **Provider turns:** each attempted provider invocation, counted by the
+  orchestrator. An invocation that raises is counted. A stop before an invocation is
+  not. Fake runs count turns, and they send no transport request.
+- **Transport requests:** the provider requests the transport admitted and sent. The
+  fake provider sends none, so this count is zero for every offline run.
+- **Unsafe acceptance:** a faulty answer that verifies, or a verified claim whose text
+  is not canonical. Both must be zero. The offline run measured zero.
+- **Cost:** unknown for the fake provider. It is never reported as zero.
+- **Tokens and latency:** tokens are estimates, one per two characters. Latency is
+  local and varies from run to run.
+
+The mid-run case scripts a provider failure (`timeout`) after one successful tool
+call. It must end `provider_error`, keep exactly one tool success, and carry no
+claims. It is a scripted stop, not a measured fault in a real provider.
+
+A run's ordered trace is a list of events with a `sequence` number, a `kind`, a fixed
+`outcome`, an `elapsed_ms` value, a `tool` name (allowlisted only, and never for an
+unknown tool), and any `failure_codes`. The kinds are `provider_turn`, `admission`,
+`tool_outcome`, `verification`, `provider_failure`, `budget_stop`, and `terminal`.
+Every run ends with one `terminal` event. A trace holds no prompt, transcript, tool
+argument or result, telemetry, claim text, replay block, or raw error text.
+
+Default output is unchanged apart from the new `provider_turns` key. The trace is
+left out of `AgentRun` JSON. To export it for the offline run, add `--json --trace`:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate_agent.py --json --trace
+```
+
+The matrix is deterministic. Two runs produce the same case outcomes, counts, and
+event order. Only timing differs.
+
+Measured on the offline run on 2026-11-15 (fake provider, not a live model):
+verified completion 24/24, expected failure handling 216/216, attacks rejected
+168/168 with 0 accepted, 1056 provider turns, 0 transport requests, 2352 trace
+events, scenario agreement 12/12 (a label check, not causal accuracy).
+
 #### Live validation: one successful synthetic investigation (Anthropic, 2026-11-13)
 
 One live investigation with the Anthropic provider completed and verified. It is a

@@ -10,6 +10,12 @@ and seed it runs three kinds of case:
 - Tool and provider failures, such as a refused tool request, a timeout, a
   refusal, and an exhausted tool budget. Each must end in the status it is
   expected to produce.
+- A provider failure after one successful tool call. It must end as a provider
+  error, keep that one tool result, and carry no claims.
+
+Cases built to verify are reported separately from cases built to stop or reject
+safely, so each group has its own denominator. ``--json --trace`` also exports each
+case's ordered lifecycle trace.
 
 Token counts from the fake provider are estimates, one token per two characters
 of text, and they are labelled as estimates. No cost is reported for the fake
@@ -119,16 +125,25 @@ class MeasuringProvider:
 
     provider_id = "fake-deterministic"
 
-    def __init__(self, turns: Sequence[ProviderTurn]) -> None:
+    def __init__(
+        self,
+        turns: Sequence[ProviderTurn],
+        final_failure: ProviderFailureReason = ProviderFailureReason.EXHAUSTED,
+    ) -> None:
         self._turns = tuple(turns)
         self._position = 0
+        self._final_failure = final_failure
         self.transcripts: list[tuple[ProviderMessage, ...]] = []
 
     def next_turn(self, transcript: Sequence[ProviderMessage]) -> ProviderTurn:
-        """Return the next scripted turn, with an estimated usage attached."""
+        """Return the next scripted turn, or fail once the script has run out.
+
+        ``final_failure`` lets a case stop mid-run, after its scripted tool calls,
+        with a provider failure instead of an empty script.
+        """
         self.transcripts.append(tuple(transcript))
         if self._position >= len(self._turns):
-            raise ProviderError(ProviderFailureReason.EXHAUSTED)
+            raise ProviderError(self._final_failure)
         turn = self._turns[self._position]
         self._position += 1
         reply = turn.final_text or (
@@ -156,13 +171,18 @@ class FailingProvider:
 
 @dataclass(frozen=True)
 class Case:
-    """One run to perform: its name, its expected status, and how to run it."""
+    """One run to perform: its name, its expected status, and how to run it.
+
+    ``expected_tool_successes`` is checked exactly when it is set. It is used by a
+    case that must keep the tool results it obtained before a provider failure.
+    """
 
     name: str
     kind: str
     expected: AgentStatus
     provider: Callable[[], ModelProvider]
     limits: BudgetLimits
+    expected_tool_successes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -171,15 +191,26 @@ class Outcome:
 
     name: str
     kind: str
+    seed: int | None
     status: AgentStatus
     expected: AgentStatus
+    expected_tool_successes: int | None
     run: AgentRun
     latency_seconds: float
     outside_report: int
 
     @property
+    def designed_to_complete(self) -> bool:
+        """True for a case built to reach a verified answer, not to stop."""
+        return self.expected is AgentStatus.VERIFIED
+
+    @property
     def met_expectation(self) -> bool:
-        """True when the run ended in the status this case expects."""
+        """True when the run ended as expected, with the tool results it should keep."""
+        if self.expected_tool_successes is not None and (
+            self.run.tool_successes != self.expected_tool_successes
+        ):
+            return False
         if self.expected in REJECTING_STATUSES:
             return self.status in REJECTING_STATUSES and not self.run.claims
         return self.status is self.expected
@@ -344,6 +375,16 @@ def build_cases(
             lambda: FailingProvider(ProviderFailureReason.REFUSED),
             limits,
         ),
+        Case(
+            "provider_failure_after_tool",
+            "mid_run",
+            AgentStatus.PROVIDER_ERROR,
+            lambda: MeasuringProvider(
+                tools[:1], final_failure=ProviderFailureReason.TIMEOUT
+            ),
+            limits,
+            expected_tool_successes=1,
+        ),
     ]
     for name, text in _attack_answers(report, events):
         expected = AgentStatus.MALFORMED_OUTPUT if name in {
@@ -369,11 +410,18 @@ def run_case(
     case: Case,
     report: Investigation,
     events: Mapping[str, TelemetryEvent],
+    seed: int | None = None,
 ) -> Outcome:
     """Run one case with its own budget, and measure what it produced."""
     budget = RunBudget(case.limits)
     started = time.perf_counter()
-    run = run_agent(report, events, case.provider(), budget=budget)
+    run = run_agent(
+        report,
+        events,
+        case.provider(),
+        budget=budget,
+        trace_clock=time.perf_counter,
+    )
     latency = time.perf_counter() - started
     canonical = canonical_records(report)
     outside = sum(
@@ -384,8 +432,10 @@ def run_case(
     return Outcome(
         name=case.name,
         kind=case.kind,
+        seed=seed,
         status=run.status,
         expected=case.expected,
+        expected_tool_successes=case.expected_tool_successes,
         run=run,
         latency_seconds=latency,
         outside_report=outside,
@@ -419,8 +469,28 @@ def summarize(
     verified = [item for item in outcomes if item.status is AgentStatus.VERIFIED]
     final_answers = [item for item in outcomes if item.status in FINAL_ANSWER_STATUSES]
     comparable = [value for value in agreement if value is not None]
+    complete = [item for item in outcomes if item.designed_to_complete]
+    stopping = [item for item in outcomes if not item.designed_to_complete]
     return {
         "cases": len(outcomes),
+        "verified_completion": {
+            "designed": len(complete),
+            "verified": sum(
+                1 for item in complete if item.status is AgentStatus.VERIFIED
+            ),
+            "met": sum(1 for item in complete if item.met_expectation),
+        },
+        "expected_failure_handling": {
+            "designed": len(stopping),
+            "met": sum(1 for item in stopping if item.met_expectation),
+        },
+        "provider_turns": sum(item.run.provider_turns for item in outcomes),
+        "transport_requests": sum(
+            item.run.accounting.provider_requests
+            for item in outcomes
+            if item.run.accounting is not None
+        ),
+        "trace_events": sum(len(item.run.trace) for item in outcomes),
         "structured_output_validity": _rate(
             sum(
                 1
@@ -467,17 +537,40 @@ def _mean(values: Sequence[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
+def trace_record(scenario: ScenarioId, outcome: Outcome) -> dict[str, Any]:
+    """One case's ordered trace, labelled with its scenario, seed, and expectation.
+
+    The events hold only fixed categories, so this record can be exported as is.
+    """
+    return {
+        "scenario": scenario.value,
+        "seed": outcome.seed,
+        "case": outcome.name,
+        "expected": outcome.expected.value,
+        "status": outcome.status.value,
+        "events": [
+            event.model_dump(mode="json") for event in outcome.run.trace
+        ],
+    }
+
+
 def evaluate(
     scenarios: Sequence[ScenarioId],
     seeds: Sequence[int],
     ticks: int,
     limits: BudgetLimits,
+    *,
+    keep_traces: bool = False,
 ) -> dict[str, Any]:
-    """Run every case for every scenario and seed, and summarize the results."""
+    """Run every case for every scenario and seed, and summarize the results.
+
+    Traces are kept only when asked for, so the default output is unchanged.
+    """
     per_scenario: dict[str, Any] = {}
     all_outcomes: list[Outcome] = []
     all_agreement: list[bool | None] = []
     skipped: list[str] = []
+    traces: list[dict[str, Any]] = []
     for scenario in scenarios:
         outcomes: list[Outcome] = []
         agreement: list[bool | None] = []
@@ -488,14 +581,16 @@ def evaluate(
                 continue
             report, events = built
             for case in build_cases(report, events, limits):
-                outcome = run_case(case, report, events)
+                outcome = run_case(case, report, events, seed)
                 outcomes.append(outcome)
+                if keep_traces:
+                    traces.append(trace_record(scenario, outcome))
                 if case.name == "reference":
                     agreement.append(scenario_agreement(scenario, outcome.run))
         per_scenario[scenario.value] = summarize(outcomes, agreement)
         all_outcomes.extend(outcomes)
         all_agreement.extend(agreement)
-    return {
+    result: dict[str, Any] = {
         "provider": "fake-deterministic",
         "cost": "unknown: the fake provider has no price",
         "token_basis": "estimated: one token per two characters",
@@ -505,6 +600,9 @@ def evaluate(
         "scenarios": per_scenario,
         "totals": summarize(all_outcomes, all_agreement),
     }
+    if keep_traces:
+        result["traces"] = traces
+    return result
 
 
 def _render(result: Mapping[str, Any]) -> str:
@@ -526,18 +624,37 @@ def _render(result: Mapping[str, Any]) -> str:
             f"{item['estimated_tokens_total']:>8} {item['mean_latency_ms']:>8}"
         )
     totals = result["totals"]
+    flow_header = (
+        f"{'scenario':<24} {'complete':>9} {'stop ok':>9} {'turns':>7} "
+        f"{'requests':>9} {'events':>7}"
+    )
+    flow_rows = []
+    for name, item in [*result["scenarios"].items(), ("ALL", totals)]:
+        complete = item["verified_completion"]
+        stopping = item["expected_failure_handling"]
+        complete_text = f"{complete['met']}/{complete['designed']}"
+        stop_text = f"{stopping['met']}/{stopping['designed']}"
+        flow_rows.append(
+            f"{name:<24} {complete_text:>9} {stop_text:>9} "
+            f"{item['provider_turns']:>7} {item['transport_requests']:>9} "
+            f"{item['trace_events']:>7}"
+        )
     safety = (
         f"safety: attacks accepted {totals['attacks_accepted']}, "
         f"novel statements accepted {totals['novel_statements_accepted']}, "
         f"expectations met {totals['expectations_met']}/{totals['cases']}"
     )
     notes = [
+        "run: offline, fake provider (deterministic, no network, no paid request)",
+        "complete = cases built to verify; stop ok = cases built to stop or reject",
         "cost: unknown for the fake provider (no price configured)",
         "tokens: estimated, one per two characters; not provider counts",
         "scenario agreement (label check, not causal accuracy): "
         f"{totals['scenario_agreement']}",
     ]
-    return "\n".join([header, *rows, safety, *notes])
+    return "\n".join(
+        [header, *rows, "", flow_header, *flow_rows, safety, *notes]
+    )
 
 
 def run_live(
@@ -617,7 +734,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--max-seconds", type=float, default=None)
     parser.add_argument("--max-retries", type=int, default=None)
     parser.add_argument("--json", action="store_true", help="print the full summary")
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="add each offline case's ordered trace to the JSON output",
+    )
     args = parser.parse_args(argv)
+    if args.trace and (not args.json or args.provider != "fake"):
+        print(
+            "--trace needs --json and applies only to the offline run",
+            file=sys.stderr,
+        )
+        return EXIT_CONFIGURATION
 
     if args.provider in ("openai", "anthropic") and not args.live:
         print(
@@ -666,7 +794,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.ticks,
         )
 
-    result = evaluate(scenarios, args.seeds, args.ticks, limits)
+    result = evaluate(scenarios, args.seeds, args.ticks, limits, keep_traces=args.trace)
     if args.json:
         print(json.dumps(result, indent=2, default=str))
     else:

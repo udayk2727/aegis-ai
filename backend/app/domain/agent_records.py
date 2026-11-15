@@ -472,6 +472,73 @@ class RunAccounting(BaseModel):
     )
 
 
+class TraceEventKind(StrEnum):
+    """The lifecycle step a trace event records. Each kind has its own outcomes."""
+
+    PROVIDER_TURN = "provider_turn"
+    ADMISSION = "admission"
+    TOOL_OUTCOME = "tool_outcome"
+    VERIFICATION = "verification"
+    PROVIDER_FAILURE = "provider_failure"
+    BUDGET_STOP = "budget_stop"
+    TERMINAL = "terminal"
+
+
+MAX_TRACE_EVENTS = 128
+
+TRACE_OUTCOMES: dict[TraceEventKind, frozenset[str]] = {
+    TraceEventKind.PROVIDER_TURN: frozenset({"invoked"}),
+    TraceEventKind.ADMISSION: frozenset(
+        {"admitted", *(stop.value for stop in BudgetStop)}
+    ),
+    TraceEventKind.TOOL_OUTCOME: frozenset(
+        {"ok", "refused_unknown_tool", "refused_invalid_arguments", "refused_no_record"}
+    ),
+    TraceEventKind.VERIFICATION: frozenset(
+        {"verified", "rejected", "malformed_output"}
+    ),
+    TraceEventKind.PROVIDER_FAILURE: frozenset(
+        reason.value for reason in ProviderFailureReason
+    ),
+    TraceEventKind.BUDGET_STOP: frozenset(stop.value for stop in BudgetStop),
+    TraceEventKind.TERMINAL: frozenset(status.value for status in AgentStatus),
+}
+
+
+class TraceEvent(BaseModel):
+    """One ordered step of a run, from fixed categories only.
+
+    ``sequence`` is 1-based within the run. ``elapsed_ms`` is set only when the
+    caller supplies a trace clock, and it is None otherwise, so a run without one
+    reads no extra clock. A tool name appears only for an allowlisted tool, and
+    never for an unknown one. A trace holds no prompt, transcript, tool argument or
+    result, telemetry, claim text, replay block, or raw error text, so it can be
+    shown without the content the model saw.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sequence: Annotated[int, Field(ge=1)]
+    kind: TraceEventKind
+    outcome: str = Field(min_length=1, max_length=40)
+    elapsed_ms: Annotated[int, Field(ge=0)] | None = None
+    tool: str | None = Field(default=None, max_length=MAX_TOOL_NAME_CHARS)
+    failure_codes: tuple[FailureCode, ...] = Field(default=(), max_length=MAX_CLAIMS)
+
+    @model_validator(mode="after")
+    def _fields_match_kind(self) -> Self:
+        """Check that the outcome, tool, and failure codes fit the event kind."""
+        if self.outcome not in TRACE_OUTCOMES[self.kind]:
+            raise ValueError("the outcome does not belong to this event kind")
+        if self.tool is not None and self.kind is not TraceEventKind.TOOL_OUTCOME:
+            raise ValueError("only a tool outcome names a tool")
+        if self.outcome == "refused_unknown_tool" and self.tool is not None:
+            raise ValueError("an unknown tool is never named")
+        if self.failure_codes and self.kind is not TraceEventKind.VERIFICATION:
+            raise ValueError("only a verification event carries failure codes")
+        return self
+
+
 class AgentRun(BaseModel):
     """The result of one agent run over one investigation.
 
@@ -501,8 +568,18 @@ class AgentRun(BaseModel):
     )
     tool_successes: Annotated[int, Field(ge=0)] = 0
     tool_rejections: Annotated[int, Field(ge=0)] = 0
+    # Provider invocations attempted by the orchestrator, including one that raised.
+    # A stop before an invocation is not counted. Fake runs count turns too.
+    provider_turns: Annotated[int, Field(ge=0)] = 0
     budget_stop: BudgetStop | None = None
     accounting: RunAccounting | None = None
+    # The ordered lifecycle trace. It is excluded from default serialization, and a
+    # caller that wants it reads it explicitly.
+    trace: tuple[TraceEvent, ...] = Field(
+        default=(),
+        max_length=MAX_TRACE_EVENTS,
+        exclude=True,
+    )
 
     @model_validator(mode="after")
     def _content_only_when_verified(self) -> Self:

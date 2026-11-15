@@ -10,6 +10,9 @@ first limit a run reaches: tool requests, total tokens, the run deadline, or the
 provider's request limit, which the provider enforces before each request. A
 provider failure maps to a fixed status.
 
+The loop also records an ordered lifecycle trace (see ``agent_trace``). Each step
+is recorded where it happens, so the trace shows the order the run took.
+
 The transcript holds the fixed instructions, the investigation ID, and tool
 results. It does not hold the report's narrative text, which the model reads
 only through tools.
@@ -17,6 +20,7 @@ only through tools.
 
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 
 from pydantic import ValidationError
 
@@ -42,6 +46,7 @@ from app.services.agent_budget import PricingTable, RunBudget, build_accounting
 from app.services.agent_compact import expand_compact
 from app.services.agent_provider import ModelProvider, ProviderError
 from app.services.agent_tools import dispatch
+from app.services.agent_trace import TraceRecorder
 from app.services.agent_verification import hydrate_claims, verify_output
 
 DEFAULT_MAX_TOOL_CALLS = 6
@@ -62,6 +67,16 @@ _STATUS_FOR_FAILURE: dict[ProviderFailureReason, AgentStatus] = {
 }
 
 
+@dataclass
+class _RunState:
+    """What one run has counted so far, read by every exit path."""
+
+    trace: TraceRecorder
+    tool_successes: int = 0
+    tool_rejections: int = 0
+    provider_turns: int = 0
+
+
 def run_agent(
     report: Investigation,
     events_by_id: Mapping[str, TelemetryEvent],
@@ -74,6 +89,7 @@ def run_agent(
     budget: RunBudget | None = None,
     pricing: PricingTable | None = None,
     answer_format: AnswerFormat = AnswerFormat.FULL,
+    trace_clock: Callable[[], float] | None = None,
 ) -> AgentRun:
     """Run the agent over one report and return the verified or refused result.
 
@@ -83,6 +99,8 @@ def run_agent(
     time limit takes its hard maximum. ``pricing`` is optional, and without it the
     cost is reported as unknown. ``answer_format`` must match the format the
     provider was asked to submit. A mismatch is malformed output, not a guess.
+    ``trace_clock`` times the trace events. It is separate from the budget's clock,
+    so a run without one reads no extra clock reading.
     """
     if budget is None:
         limits = _legacy_limits(max_tool_calls, max_total_tokens, max_seconds)
@@ -90,6 +108,7 @@ def run_agent(
     if budget.limits.max_tool_calls < 0:
         raise ValueError("max_tool_calls must be zero or more")
 
+    state = _RunState(trace=TraceRecorder(trace_clock))
     transcript = [
         ProviderMessage(role=MessageRole.SYSTEM, content=INSTRUCTIONS),
         ProviderMessage(
@@ -97,54 +116,50 @@ def run_agent(
             content=f"Review investigation {report.investigation_id}.",
         ),
     ]
-    tool_successes = 0
-    tool_rejections = 0
     while True:
         if budget.stop_before_call() is not None:
             return _result(
-                report,
-                provider,
-                budget,
-                AgentStatus.BUDGET_EXHAUSTED,
-                tool_successes,
-                tool_rejections,
-                pricing,
+                report, provider, budget, state, AgentStatus.BUDGET_EXHAUSTED, pricing
             )
 
+        diagnostics_before = len(budget.diagnostics)
+        state.provider_turns += 1
+        state.trace.provider_turn()
         try:
             turn = provider.next_turn(transcript)
         except ProviderError as error:
             budget.add_usage(error.usage)
+            state.trace.admissions(budget.diagnostics[diagnostics_before:])
             if error.reason is ProviderFailureReason.BUDGET:
                 return _result(
                     report,
                     provider,
                     budget,
+                    state,
                     AgentStatus.BUDGET_EXHAUSTED,
-                    tool_successes,
-                    tool_rejections,
                     pricing,
                 )
+            state.trace.provider_failure(error.reason)
             return _result(
                 report,
                 provider,
                 budget,
+                state,
                 _STATUS_FOR_FAILURE.get(error.reason, AgentStatus.PROVIDER_ERROR),
-                tool_successes,
-                tool_rejections,
                 pricing,
                 failure=error.reason,
                 http_status=error.http_status,
                 request_id=error.request_id,
             )
+        state.trace.admissions(budget.diagnostics[diagnostics_before:])
         if not isinstance(turn, ProviderTurn):
+            state.trace.provider_failure(ProviderFailureReason.API_ERROR)
             return _result(
                 report,
                 provider,
                 budget,
+                state,
                 AgentStatus.PROVIDER_ERROR,
-                tool_successes,
-                tool_rejections,
                 pricing,
                 failure=ProviderFailureReason.API_ERROR,
             )
@@ -152,13 +167,7 @@ def run_agent(
         budget.add_usage(turn.usage)
         if budget.check_after_reply() is not None:
             return _result(
-                report,
-                provider,
-                budget,
-                AgentStatus.BUDGET_EXHAUSTED,
-                tool_successes,
-                tool_rejections,
-                pricing,
+                report, provider, budget, state, AgentStatus.BUDGET_EXHAUSTED, pricing
             )
 
         if turn.tool_call is not None:
@@ -167,9 +176,8 @@ def run_agent(
                     report,
                     provider,
                     budget,
+                    state,
                     AgentStatus.BUDGET_EXHAUSTED,
-                    tool_successes,
-                    tool_rejections,
                     pricing,
                 )
             budget.record_tool_request()
@@ -183,9 +191,10 @@ def run_agent(
             )
             result = dispatch(report, turn.tool_call)
             if result.ok:
-                tool_successes += 1
+                state.tool_successes += 1
             else:
-                tool_rejections += 1
+                state.tool_rejections += 1
+            state.trace.tool_outcome(result)
             transcript.append(
                 ProviderMessage(
                     role=MessageRole.TOOL,
@@ -198,35 +207,35 @@ def run_agent(
         try:
             output = _parse_answer(turn.final_text or "", report, answer_format)
         except ValidationError:
+            state.trace.verification("malformed_output")
             return _result(
                 report,
                 provider,
                 budget,
+                state,
                 AgentStatus.MALFORMED_OUTPUT,
-                tool_successes,
-                tool_rejections,
                 pricing,
             )
 
         failures = verify_output(output, report, events_by_id)
         if failures:
+            state.trace.verification("rejected", failures)
             return _result(
                 report,
                 provider,
                 budget,
+                state,
                 AgentStatus.REJECTED,
-                tool_successes,
-                tool_rejections,
                 pricing,
                 failures=tuple(failures),
             )
+        state.trace.verification("verified")
         return _result(
             report,
             provider,
             budget,
+            state,
             AgentStatus.VERIFIED,
-            tool_successes,
-            tool_rejections,
             pricing,
             claims=hydrate_claims(output.claims, report),
             proposed_checks=output.proposed_checks,
@@ -277,9 +286,8 @@ def _result(
     report: Investigation,
     provider: ModelProvider,
     budget: RunBudget,
+    state: _RunState,
     status: AgentStatus,
-    tool_successes: int,
-    tool_rejections: int,
     pricing: PricingTable | None,
     *,
     failure: ProviderFailureReason | None = None,
@@ -289,7 +297,14 @@ def _result(
     claims: Sequence[AgentClaim] = (),
     proposed_checks: Sequence[ProposedCheck] = (),
 ) -> AgentRun:
-    """Build the run result. Claims appear only when the run is verified."""
+    """Build the run result. Claims appear only when the run is verified.
+
+    This is the only exit from the loop, so the budget-stop and terminal events are
+    recorded here, once per run.
+    """
+    if status is AgentStatus.BUDGET_EXHAUSTED and budget.stop is not None:
+        state.trace.budget_stop(budget.stop)
+    state.trace.terminal(status)
     verified = status is AgentStatus.VERIFIED
     return AgentRun(
         investigation_id=report.investigation_id,
@@ -306,14 +321,16 @@ def _result(
         provider_failure=failure,
         provider_http_status=http_status,
         provider_request_id=request_id,
-        tool_successes=tool_successes,
-        tool_rejections=tool_rejections,
+        tool_successes=state.tool_successes,
+        tool_rejections=state.tool_rejections,
+        provider_turns=state.provider_turns,
         budget_stop=budget.stop,
         accounting=build_accounting(
             budget=budget,
             final_status=status,
             model_id=getattr(provider, "model_id", None),
-            completed_tool_calls=tool_successes,
+            completed_tool_calls=state.tool_successes,
             pricing=pricing,
         ),
+        trace=state.trace.events,
     )
