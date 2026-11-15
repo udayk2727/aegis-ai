@@ -1931,3 +1931,30 @@ values differed.
 - The live path does not export traces. Transport admissions appear in the trace only
   where the live transport records them, and no live run has been traced.
 - Traces are not stored. A caller that needs them must keep them.
+
+### 14.12 Day 9: demo listing of approved baselines (read-only, development only)
+
+Status: **implemented.** Local development only, for the planned React dashboard.
+
+**Gap.** The incident and investigation endpoints require each `baseline_run_id` by
+name. Those IDs are returned only by `POST /api/v1/simulations`, and the approved
+manifest is not visible over the API. After a restart, a client has no way to find
+which stored runs are approved baselines, so it cannot list or open incidents.
+
+**Decision.** Add one read-only route, `GET /api/v1/demo/baselines`. It returns the
+approved baselines that are also stored, sorted by run ID, with `data_origin` set to
+`synthetic`. An approved run that is not stored is left out, because the incident
+endpoints would refuse it with a 404. The route is registered only when
+`AEGIS_DEMO_API_ENABLED` is true. The settings refuse that flag in production, the
+same way they refuse the simulation endpoint.
+
+**Unchanged.** Existing routes and response contracts are unchanged. The listing
+reads the trusted-baseline registry and the store. It does not start a simulation,
+call a language model, write state, or approve a baseline. Preparing data still uses
+`POST /api/v1/simulations`, which is the only write, and it is unauthenticated.
+
+**Limitations.** The store is in memory, so a restart clears it. Each incident
+request recomputes its incidents from the store. The listing is not paginated, which
+is acceptable because it can hold no more entries than the manifest approves. The
+route has no authentication, so it carries the same loopback-only restriction as the
+simulation endpoint.

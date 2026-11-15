@@ -16,6 +16,7 @@ from app import __version__
 from app.config import Settings, load_settings
 from app.routers import (
     analytics,
+    demo,
     events,
     incidents,
     investigations,
@@ -41,7 +42,8 @@ def create_app(
 
     Trusted baselines come from ``trusted_baselines`` when given, otherwise from
     the manifest named in the settings, otherwise none. With none, every incident
-    request that names a baseline is refused.
+    request that names a baseline is refused. The demo listing is registered only
+    when the settings enable it.
     """
     if settings is None:
         settings = load_settings(os.environ)
@@ -68,6 +70,8 @@ def create_app(
     application.include_router(analytics.router)
     application.include_router(incidents.router)
     application.include_router(investigations.router)
+    if settings.demo_api_enabled:
+        application.include_router(demo.router)
     return application
 
 

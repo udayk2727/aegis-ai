@@ -34,6 +34,8 @@ Available now:
 - `GET /api/v1/incidents` and `GET /api/v1/incidents/{incident_id}`: read-only
   incidents correlated from detection alerts, with evidence and a timeline
   (see [Incident correlation](#incident-correlation))
+- `GET /api/v1/demo/baselines`: development-only, read-only listing of stored
+  approved baselines for the demo workflow (see [Demo workflow](#demo-workflow))
 - `GET /api/v1/incidents/{incident_id}/investigation`: read-only, deterministic
   investigation report with verified observations, ranked hypotheses,
   contradictory and missing evidence, and read-only checks
@@ -908,6 +910,71 @@ Invoke-RestMethod -Uri "$base/incidents/$incident/investigation?baseline_run_id=
 .\.venv\Scripts\python.exe scripts\evaluate_investigations.py
 ```
 
+## Demo workflow
+
+This is the local, read-only path a dashboard uses to browse prepared synthetic
+incidents and open their investigations. It is development only. It uses the
+simulation endpoint to prepare data, then only reads.
+
+**Prepare the data.** Approve the baselines offline, then start the API with the
+demo listing on. The three variables are development-only:
+
+```powershell
+cd C:\Projects\aegis-ai
+.\.venv\Scripts\python.exe scripts\approve_baselines.py --seeds 301 302 --ticks 288
+$env:AEGIS_ENVIRONMENT = "development"
+$env:AEGIS_SIMULATION_API_ENABLED = "true"
+$env:AEGIS_DEMO_API_ENABLED = "true"
+$env:AEGIS_TRUSTED_BASELINES_PATH = "local\trusted_baselines.json"
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000
+```
+
+**Browse the incidents.** In a second PowerShell window, the store starts empty, so
+the first listing returns no baselines. Then create the two approved baselines and
+one fault run, and list the baselines again:
+
+```powershell
+$base = "http://127.0.0.1:8000/api/v1"
+$json = "application/json"
+Invoke-RestMethod -Uri "$base/demo/baselines"   # items: [], total: 0
+Invoke-RestMethod -Method Post -Uri "$base/simulations" -ContentType $json -Body '{"scenario":"normal_operation","seed":301,"ticks":288}' | Out-Null
+Invoke-RestMethod -Method Post -Uri "$base/simulations" -ContentType $json -Body '{"scenario":"normal_operation","seed":302,"ticks":288}' | Out-Null
+Invoke-RestMethod -Method Post -Uri "$base/simulations" -ContentType $json -Body '{"scenario":"cpu_saturation","seed":311,"ticks":288}' | Out-Null
+$baselines = (Invoke-RestMethod -Uri "$base/demo/baselines").items.run_id
+$query = ($baselines | ForEach-Object { "baseline_run_id=$_" }) -join "&"
+Invoke-RestMethod -Uri "$base/incidents?$query"
+```
+
+**Open one investigation.** Copy an `incident_id` from the list and fetch its
+report with the same baselines. Hypotheses are always `unverified`, and
+`root_cause_assessment` is always `not_assessed`:
+
+```powershell
+$incidentId = "<incident_id from the list>"
+Invoke-RestMethod -Uri "$base/incidents/$incidentId/investigation?$query" | ConvertTo-Json -Depth 8
+```
+
+An unknown ID returns `404 incident_not_found`. An empty store returns
+`{"items": [], "total": 0}` from the listing, not an error.
+
+**The same steps in Swagger UI.** Open <http://127.0.0.1:8000/docs>:
+
+1. Run `POST /api/v1/simulations` three times with the bodies above and note
+   each `run_id` from the response.
+2. Run `GET /api/v1/demo/baselines` and note the `run_id` values in `items`.
+3. Run `GET /api/v1/incidents`. Under `baseline_run_id`, Swagger UI shows an
+   "Add string item" control. Add one entry per baseline run ID.
+4. Copy an `incident_id` from the response. Run
+   `GET /api/v1/incidents/{incident_id}/investigation` with the same baseline
+   run IDs.
+
+**Limitations.** The store is in memory, so a restart clears it and the steps
+must be repeated. The demo listing is registered only in development, and the
+manifest is a local file. All data is synthetic and is not production telemetry.
+The read endpoints do not call a language model, start a simulation, or perform
+remediation. For the paid agent path, use the CLI in
+[Investigation agent](#investigation-agent).
+
 ## Investigation
 
 The deterministic investigation layer reads one incident and the verdicts for its source run,
@@ -1477,6 +1544,7 @@ values stop startup with a message that names the problem.
 |----------|--------|---------|--------|
 | `AEGIS_ENVIRONMENT` | `development`, `production` | `production` | Deployment environment. An unset value fails closed. |
 | `AEGIS_SIMULATION_API_ENABLED` | `true`, `false` | `false` | Registers `POST /api/v1/simulations`. |
+| `AEGIS_DEMO_API_ENABLED` | `true`, `false` | `false` | Registers `GET /api/v1/demo/baselines`, a read-only listing of stored approved baselines. Development only. |
 | `AEGIS_TRUSTED_BASELINES_PATH` | Path to a manifest | Unset | Loads approved baselines for incident detection. Development only. Unset trusts no baseline. |
 | `AEGIS_INVESTIGATION_MAX_CITED_EVENTS` | Integer, 1 to 1000 | `100` | Caps the event IDs listed per cited evidence list in an investigation. See [Response bounds](#response-bounds). |
 

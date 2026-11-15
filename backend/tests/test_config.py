@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.config import (
+    DEMO_API_VARIABLE,
     SIMULATION_API_VARIABLE,
     ConfigurationError,
     Environment,
@@ -46,6 +47,30 @@ def test_production_with_simulation_api_enabled_is_refused() -> None:
 def test_settings_object_cannot_hold_the_unsafe_combination() -> None:
     with pytest.raises(ValidationError):
         Settings(environment=Environment.PRODUCTION, simulation_api_enabled=True)
+
+
+def test_demo_api_is_off_by_default() -> None:
+    settings = load_settings({"AEGIS_ENVIRONMENT": "development"})
+
+    assert settings.demo_api_enabled is False
+
+
+def test_development_with_demo_api_enabled() -> None:
+    settings = load_settings(
+        {"AEGIS_ENVIRONMENT": "development", DEMO_API_VARIABLE: "true"}
+    )
+
+    assert settings.demo_api_enabled is True
+
+
+def test_production_with_demo_api_enabled_is_refused() -> None:
+    with pytest.raises(ConfigurationError, match="demo API is development-only"):
+        load_settings({"AEGIS_ENVIRONMENT": "production", DEMO_API_VARIABLE: "true"})
+
+
+def test_settings_object_cannot_hold_demo_api_in_production() -> None:
+    with pytest.raises(ValidationError):
+        Settings(environment=Environment.PRODUCTION, demo_api_enabled=True)
 
 
 def test_unknown_environment_is_refused() -> None:

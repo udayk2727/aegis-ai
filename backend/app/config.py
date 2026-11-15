@@ -26,6 +26,7 @@ from pydantic import (
 
 ENVIRONMENT_VARIABLE = "AEGIS_ENVIRONMENT"
 SIMULATION_API_VARIABLE = "AEGIS_SIMULATION_API_ENABLED"
+DEMO_API_VARIABLE = "AEGIS_DEMO_API_ENABLED"
 TRUSTED_BASELINES_VARIABLE = "AEGIS_TRUSTED_BASELINES_PATH"
 INVESTIGATION_CAP_VARIABLE = "AEGIS_INVESTIGATION_MAX_CITED_EVENTS"
 LIVE_MODEL_VARIABLE = "AEGIS_LLM_MODEL"
@@ -51,6 +52,7 @@ class Settings(BaseModel):
 
     environment: Environment = Environment.PRODUCTION
     simulation_api_enabled: bool = False
+    demo_api_enabled: bool = False
     trusted_baselines_path: Path | None = None
     investigation_max_cited_events: Annotated[int, Field(ge=1, le=1000)] = 100
 
@@ -62,6 +64,11 @@ class Settings(BaseModel):
         if self.simulation_api_enabled:
             raise ValueError(
                 "the simulation API has no authentication and is development-only; "
+                "it cannot be enabled when the environment is production"
+            )
+        if self.demo_api_enabled:
+            raise ValueError(
+                "the demo API is development-only; "
                 "it cannot be enabled when the environment is production"
             )
         if self.trusted_baselines_path is not None:
@@ -79,6 +86,8 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         raw["environment"] = environ[ENVIRONMENT_VARIABLE]
     if SIMULATION_API_VARIABLE in environ:
         raw["simulation_api_enabled"] = environ[SIMULATION_API_VARIABLE]
+    if DEMO_API_VARIABLE in environ:
+        raw["demo_api_enabled"] = environ[DEMO_API_VARIABLE]
     if TRUSTED_BASELINES_VARIABLE in environ:
         raw["trusted_baselines_path"] = environ[TRUSTED_BASELINES_VARIABLE]
     if INVESTIGATION_CAP_VARIABLE in environ:
