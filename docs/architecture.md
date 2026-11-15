@@ -81,7 +81,16 @@ intended to:
 | Action executor        | Perform approved remediation through audited adapters   | Planned |
 | Audit log              | Append-only record of decisions and actions             | Planned |
 | Data access adapters   | Oracle and other enterprise sources, behind interfaces  | Planned |
-| Frontend               | Dashboard, investigation workspace, approval screens    | Planned |
+| Frontend               | Dashboard, investigation workspace, approval screens    | Started (local read-only dashboard; see the note below the table) |
+
+The local dashboard in `frontend/` is React 19, TypeScript, and Vite. It is development
+only. It reads the Day 9 demo endpoints through the Vite proxy on `/api/v1` and does not
+start simulations or write anything. Its only inputs are `GET /api/v1/demo/baselines`,
+`GET /api/v1/incidents`, and `GET /api/v1/incidents/{id}/investigation`, all with the same
+`baseline_run_id` values. Root cause stays `not_assessed` in the view, and hypotheses are
+shown as `unverified`. Approval screens and authentication are not built. The dashboard
+adds no endpoint. Any future write or action endpoint still needs the authentication
+design required by CLAUDE.md, security rule 6.
 
 ## 4. Backend structure
 
@@ -199,12 +208,11 @@ retrieval shape the database adapter will need, not a persistence design.
 | 4     | Investigation agents with LLM adapter         | Partial: deterministic investigation (section 14); agent library with a fake provider, an optional OpenAI adapter not yet run live, and an optional Anthropic adapter with one recorded single-case live run (section 14.9) |
 | 5     | Approval workflow and audit log               | Planned     |
 | 6     | Controlled action execution                   | Planned     |
-| 7     | Frontend dashboard and workspace              | Planned     |
+| 7     | Frontend dashboard and workspace              | Started: local read-only dashboard (`frontend/`); approval workflow not built |
 | 8     | Containerization and Kubernetes deployment    | Planned     |
 
 ## 9. Open decisions
 
-- Frontend framework (React, or another choice)
 - Authentication provider and token model
 - Message or queue technology for ingestion
 - Hosting and secrets manager for each environment

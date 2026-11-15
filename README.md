@@ -975,6 +975,70 @@ The read endpoints do not call a language model, start a simulation, or perform
 remediation. For the paid agent path, use the CLI in
 [Investigation agent](#investigation-agent).
 
+## Dashboard
+
+The local React dashboard in `frontend/` reads the demo endpoints above. It only
+reads. The data is prepared by the same steps as the demo workflow, against the
+same running API.
+
+**Which port each workflow uses.** The two workflows use different ports, so
+check which one you are following:
+
+| Workflow | Port | Where it is set |
+|---|---|---|
+| Demo workflow (curl-style commands and Swagger UI) | 8000 | Commands in the Demo workflow section |
+| Dashboard (this section) | 8001 | Vite proxy default, `AEGIS_API_TARGET` |
+
+If you run the API on 8000 and want the dashboard, set
+`$env:AEGIS_API_TARGET = "http://127.0.0.1:8000"` before `npm run dev`. Use one
+port for the whole session. The dashboard only sees data in the API it proxies to.
+
+**Start the API and prepare the data.** Run these in the first PowerShell window.
+The API stays in the foreground.
+
+```powershell
+cd C:\Projects\aegis-ai
+.\.venv\Scripts\python.exe scripts\approve_baselines.py --seeds 301 302 --ticks 288
+$env:AEGIS_ENVIRONMENT = "development"
+$env:AEGIS_SIMULATION_API_ENABLED = "true"
+$env:AEGIS_DEMO_API_ENABLED = "true"
+$env:AEGIS_TRUSTED_BASELINES_PATH = "local\trusted_baselines.json"
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8001
+```
+
+In a second PowerShell window, create the two approved normal baselines and the
+CPU saturation fault run in the running API. Each run has 288 ticks:
+
+```powershell
+$base = "http://127.0.0.1:8001/api/v1"
+$json = "application/json"
+Invoke-RestMethod -Method Post -Uri "$base/simulations" -ContentType $json -Body '{"scenario":"normal_operation","seed":301,"ticks":288}' | Out-Null
+Invoke-RestMethod -Method Post -Uri "$base/simulations" -ContentType $json -Body '{"scenario":"normal_operation","seed":302,"ticks":288}' | Out-Null
+Invoke-RestMethod -Method Post -Uri "$base/simulations" -ContentType $json -Body '{"scenario":"cpu_saturation","seed":311,"ticks":288}' | Out-Null
+```
+
+**Start the dashboard.** In a third PowerShell window, install the locked
+dependencies once, then start the Vite development server:
+
+```powershell
+cd C:\Projects\aegis-ai\frontend
+npm ci
+npm run dev
+```
+
+Open <http://127.0.0.1:5173>. To point the proxy at another API address, set
+`$env:AEGIS_API_TARGET` before `npm run dev`. The default is
+`http://127.0.0.1:8001`.
+
+**Checks.** From `frontend`, run `npm test`, `npm run lint`, and `npm run build`.
+The tests use mocked fetch and do not need the API. The API must be running for
+the browser checks above.
+
+**Limitations.** The store is in memory, so restarting the API clears the runs,
+and the three simulation steps must be repeated. The dashboard is development
+only and is not authenticated. It shows synthetic data. Hypotheses are always
+`unverified`, and root cause is always `not_assessed`.
+
 ## Investigation
 
 The deterministic investigation layer reads one incident and the verdicts for its source run,
