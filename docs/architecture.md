@@ -214,8 +214,14 @@ retrieval shape the database adapter will need, not a persistence design.
 ## 7. Deployment (planned)
 
 - Phase 1 (current): run locally with `uvicorn` and `pytest`.
-- Later: containerize the backend, add a local compose stack, then define
-  Kubernetes manifests in `infrastructure/`.
+- Current, local demo only: `compose.yaml` runs the backend and the built
+  dashboard on one machine, with synthetic data and the development-only routes
+  enabled. It is not a deployment. The backend image installs only
+  `requirements.txt`. See [the demo guide](demo.md#docker-compose-demo).
+- Current: `.github/workflows/ci.yml` runs the backend tests, the offline agent
+  evaluation, and the frontend checks on every push to `main` and every pull
+  request. It uses no provider credentials.
+- Planned: Kubernetes manifests in `infrastructure/`. Not started.
 - Health endpoint `GET /health` is designed for liveness and readiness probes.
 
 ## 8. Delivery phases

@@ -36,7 +36,9 @@ investigation agent, for **local development only**:
   dependencies is relaxed for exactly two packages, the OpenAI Python SDK
   (`openai==2.54.0`) and the Anthropic Python SDK (`anthropic==0.109.0`). Both are
   pinned at exact versions in `requirements-llm.txt`, and installed only for local
-  Day 7 development, after the core requirements. They are not part of
+  Day 7 development and for the backend job in `.github/workflows/ci.yml`, after
+  the core requirements. The CI job installs them so the mocked provider tests run.
+  It passes no provider key and makes no live provider call. They are not part of
   `requirements.txt`. No other package is added under this exception. Any other
   new dependency still needs justification in the pull request or commit message,
   and the owner's approval.

@@ -1,0 +1,89 @@
+# Local demo only: synthetic data, no authentication, and development-only flags.
+# Do not deploy this file. The simulation endpoint has no authentication, so it
+# must stay inside this Compose network. The only host port is the read-only
+# dashboard on 127.0.0.1.
+#
+# Start:  docker compose up --build -d
+# Seed:   docker compose --profile seed run --rm seed
+# Open:   http://127.0.0.1:8080
+# Stop:   docker compose down
+# See docs/demo.md for the full steps and the restart behavior.
+
+name: aegis-demo
+
+x-backend-build: &backend-build
+  context: .
+  dockerfile: backend/Dockerfile
+
+services:
+  # Writes the trusted-baseline manifest to the shared volume before the API
+  # starts, because the API reads the manifest once at startup.
+  approve-baselines:
+    build: *backend-build
+    command:
+      - python
+      - scripts/approve_baselines.py
+      - --seeds
+      - "301"
+      - "302"
+      - --ticks
+      - "288"
+      - --output
+      - /data/trusted_baselines.json
+    volumes:
+      - baselines:/data
+    restart: "no"
+
+  api:
+    build: *backend-build
+    depends_on:
+      approve-baselines:
+        condition: service_completed_successfully
+    environment:
+      AEGIS_ENVIRONMENT: development
+      AEGIS_SIMULATION_API_ENABLED: "true"
+      AEGIS_DEMO_API_ENABLED: "true"
+      AEGIS_TRUSTED_BASELINES_PATH: /data/trusted_baselines.json
+    volumes:
+      - baselines:/data:ro
+    # Internal only. The web service reaches it by the service name "api".
+    expose:
+      - "8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 2s
+
+  web:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  # Creates the demo runs in the running API. Run it on demand with:
+  # docker compose --profile seed run --rm seed
+  # It waits for the API's health probe itself, and it declares no dependencies,
+  # so running it never restarts or re-approves the other services.
+  seed:
+    build: *backend-build
+    profiles:
+      - seed
+    command:
+      - python
+      - scripts/load_demo_seeds.py
+      - --base-url
+      - http://api:8000
+    restart: "no"
+
+volumes:
+  baselines:

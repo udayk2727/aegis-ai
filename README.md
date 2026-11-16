@@ -19,7 +19,8 @@ so readers can see that the cause is still open.
 
 Follow the [local demo guide](docs/demo.md) to start FastAPI, load
 the synthetic data, and open the dashboard. The dashboard runs
-without an API key.
+without an API key. To run the same demo in containers, use the
+[Docker Compose section](docs/demo.md#docker-compose-demo).
 
 ## The investigation agent
 

@@ -248,6 +248,96 @@ only and is not authenticated. It shows synthetic data. Hypotheses are always
 `unverified`, and root cause is always `not_assessed`.
 
 
+## Docker Compose demo
+
+This runs the API and the built dashboard in containers on this machine. It shows
+the same synthetic data as the sections above, and it needs only Docker with
+Compose v2. It is a local demo, not a deployment. The stack enables the
+development-only routes, and the simulation endpoint has no authentication.
+
+Run these commands from the repository root in PowerShell.
+
+**Start.** Builds the images, approves the two normal baselines into a Docker
+volume, and starts the API and the dashboard:
+
+```powershell
+cd C:\Projects\aegis-ai
+docker compose up --build -d
+```
+
+**Seed.** Creates the two normal baselines and the CPU saturation run in the
+running API. The command waits for the API's health probe before it posts.
+Run it after each start, because the store is in memory:
+
+```powershell
+docker compose --profile seed run --rm seed
+```
+
+The last line should be `loaded 3 runs; the demo listing shows 2 baselines`.
+Running the command again is safe. The API answers a run it already holds with
+200 and stores nothing new.
+
+**Open.** The dashboard is published on the loopback address only:
+
+```powershell
+Start-Process http://127.0.0.1:8080
+```
+
+The incident list shows one incident. Open it. The first hypothesis, CPU resource
+saturation, is ranked first and marked **Unverified**, and the root cause reads
+**Not assessed**. To check the data without a browser, run this through the same
+port:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8080/api/v1/demo/baselines   # total: 2
+```
+
+**Restart.** To restart the API, run `docker compose restart api`. This clears the
+in-memory store, so run the seed command again. The approved manifest is on the
+`baselines` volume and loads at startup. The dashboard recovers without a restart
+of its own. A request made while the API restarts can return `502` for a few
+seconds.
+
+**Stop.** Stops and removes the containers and network, and keeps the volume:
+
+```powershell
+docker compose down
+```
+
+To remove the `baselines` volume as well, run `docker compose down -v`. The next
+`up` regenerates the manifest.
+
+**Notes.**
+
+- `docker compose up` runs the approval step on every start, and it writes the
+  same manifest each time.
+- Only the dashboard is published, on `127.0.0.1:8080`. The dashboard proxy
+  refuses every method except `GET` and `HEAD`, so the simulation endpoint is not
+  reachable from the host through it. The API has no host port. Inside the
+  Compose network it listens on all interfaces, because the dashboard container
+  must reach it. The loopback rule in [Configuration](#configuration) is about
+  host exposure, and this stack keeps the API off the host. Do not add a `ports`
+  entry for `api`.
+- The development settings are set in `compose.yaml` only. The backend image sets
+  none of them, and it installs only `requirements.txt`.
+- The image build context excludes `local/`, host virtual environments,
+  `node_modules`, build output, `.env` files, and credential files. See
+  `.dockerignore`.
+- Logs: `docker compose logs api`. Shell: `docker compose exec api sh`.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main` and every pull request:
+
+- **Backend** (Python 3.13): installs `requirements.txt`, `requirements-analytics.txt`,
+  and `requirements-llm.txt`, then runs `python -m pytest` and
+  `python scripts/evaluate_agent.py`. The evaluator's default run is offline. It
+  exits `1` if an attack is accepted and `2` if any case misses its expectation,
+  so either one fails the job.
+- **Frontend** (Node 22): `npm ci`, `npm test`, `npm run lint`, and `npm run build`.
+
+No job reads a provider key or makes a paid request.
+
 ## Configuration
 
 Settings are read from environment variables when the app starts. Invalid

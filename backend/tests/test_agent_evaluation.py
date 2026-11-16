@@ -153,6 +153,24 @@ def test_a_safety_failure_is_reported_with_a_nonzero_exit(
     assert code == EVAL.EXIT_SAFETY_FAILURE
 
 
+def test_a_missed_expectation_fails_the_run_even_with_no_accepted_attack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_evaluate = EVAL.evaluate
+
+    def regressed(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        """The real result, with one case recorded as not meeting its expectation."""
+        result = real_evaluate(*args, **kwargs)
+        result["totals"]["expectations_met"] -= 1
+        return result
+
+    monkeypatch.setattr(EVAL, "evaluate", regressed)
+
+    code = EVAL.main(["--scenarios", "cpu_saturation", "--seeds", "601"])
+
+    assert code == EVAL.EXIT_EXPECTATION_FAILURE
+
+
 def test_live_mode_is_refused_without_the_live_flag_and_builds_nothing(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
