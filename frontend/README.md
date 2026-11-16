@@ -28,4 +28,4 @@ development only and is not authenticated.
 
 The Vite dev proxy forwards `/api/v1` to `AEGIS_API_TARGET`, which defaults to
 `http://127.0.0.1:8001`. Setup, data preparation, and the browser steps are in
-the README's **Dashboard** section.
+the **Dashboard** section of the [demo guide](../docs/demo.md#dashboard).
