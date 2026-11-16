@@ -173,3 +173,53 @@ def test_main_fails_when_the_listing_shows_the_wrong_number(
 
     assert code == 1
     assert "expected 2" in capsys.readouterr().err
+
+
+def test_watch_reloads_the_runs_when_the_listing_is_empty(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    api = FakeApi(
+        {
+            f"{BASE}/api/v1/demo/baselines": [
+                (200, {"items": [], "total": 0}),
+                (200, {"items": [], "total": 2}),
+            ],
+            f"{BASE}/api/v1/simulations": [_created("run-a")],
+        }
+    )
+    sleeps: list[float] = []
+
+    SEED.keep_demo_loaded(BASE, api, sleeps.append, rounds=2)
+
+    posts = [call for call in api.calls if call[0] == "POST"]
+    assert len(posts) == 3
+    assert sleeps == [SEED.WATCH_INTERVAL_SECONDS] * 2
+    assert "reloaded the demo runs" in capsys.readouterr().out
+
+
+def test_watch_leaves_a_loaded_listing_alone() -> None:
+    api = FakeApi(
+        {f"{BASE}/api/v1/demo/baselines": [(200, {"items": [], "total": 2})]}
+    )
+
+    SEED.keep_demo_loaded(BASE, api, lambda _seconds: None, rounds=3)
+
+    assert [call[0] for call in api.calls] == ["GET", "GET", "GET"]
+
+
+def test_watch_keeps_running_while_the_api_is_unreachable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    api = FakeApi(
+        {
+            f"{BASE}/api/v1/demo/baselines": [
+                (0, None),
+                (200, {"items": [], "total": 2}),
+            ],
+        }
+    )
+
+    SEED.keep_demo_loaded(BASE, api, lambda _seconds: None, rounds=2)
+
+    assert len(api.calls) == 2
+    assert "status 0" in capsys.readouterr().err

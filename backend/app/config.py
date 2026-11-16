@@ -28,6 +28,8 @@ ENVIRONMENT_VARIABLE = "AEGIS_ENVIRONMENT"
 SIMULATION_API_VARIABLE = "AEGIS_SIMULATION_API_ENABLED"
 DEMO_API_VARIABLE = "AEGIS_DEMO_API_ENABLED"
 TRUSTED_BASELINES_VARIABLE = "AEGIS_TRUSTED_BASELINES_PATH"
+HOSTED_DEMO_VARIABLE = "AEGIS_HOSTED_DEMO_ENABLED"
+HOSTED_SNAPSHOT_VARIABLE = "AEGIS_HOSTED_DEMO_SNAPSHOT_PATH"
 INVESTIGATION_CAP_VARIABLE = "AEGIS_INVESTIGATION_MAX_CITED_EVENTS"
 LIVE_MODEL_VARIABLE = "AEGIS_LLM_MODEL"
 OPENAI_API_KEY_VARIABLE = "OPENAI_API_KEY"
@@ -54,11 +56,36 @@ class Settings(BaseModel):
     simulation_api_enabled: bool = False
     demo_api_enabled: bool = False
     trusted_baselines_path: Path | None = None
+    hosted_demo_enabled: bool = False
+    hosted_demo_snapshot_path: Path | None = None
     investigation_max_cited_events: Annotated[int, Field(ge=1, le=1000)] = 100
 
     @model_validator(mode="after")
+    def _hosted_demo_mode(self) -> Self:
+        """Require an explicit production environment and a snapshot for hosted mode.
+
+        Hosted mode is the one production configuration that loads synthetic data.
+        It is off by default, and the snapshot path is accepted only with it on.
+        """
+        if self.hosted_demo_enabled:
+            if self.environment is not Environment.PRODUCTION:
+                raise ValueError(
+                    "hosted demo mode runs with AEGIS_ENVIRONMENT=production"
+                )
+            if self.hosted_demo_snapshot_path is None:
+                raise ValueError("hosted demo mode needs a snapshot path")
+        elif self.hosted_demo_snapshot_path is not None:
+            raise ValueError("a snapshot path is set but hosted demo mode is off")
+        return self
+
+    @model_validator(mode="after")
     def _development_only_features(self) -> Self:
-        """Refuse development-only features when the environment is production."""
+        """Refuse development-only features when the environment is production.
+
+        Hosted mode is production too, so these refusals still apply to it. The
+        simulation endpoint, the demo flag, and the manifest stay refused, and the
+        hosted demo serves its listing from the snapshot instead.
+        """
         if self.environment is not Environment.PRODUCTION:
             return self
         if self.simulation_api_enabled:
@@ -90,6 +117,10 @@ def load_settings(environ: Mapping[str, str]) -> Settings:
         raw["demo_api_enabled"] = environ[DEMO_API_VARIABLE]
     if TRUSTED_BASELINES_VARIABLE in environ:
         raw["trusted_baselines_path"] = environ[TRUSTED_BASELINES_VARIABLE]
+    if HOSTED_DEMO_VARIABLE in environ:
+        raw["hosted_demo_enabled"] = environ[HOSTED_DEMO_VARIABLE]
+    if HOSTED_SNAPSHOT_VARIABLE in environ:
+        raw["hosted_demo_snapshot_path"] = environ[HOSTED_SNAPSHOT_VARIABLE]
     if INVESTIGATION_CAP_VARIABLE in environ:
         raw["investigation_max_cited_events"] = environ[INVESTIGATION_CAP_VARIABLE]
     try:

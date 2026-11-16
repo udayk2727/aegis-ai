@@ -2679,7 +2679,7 @@ values differed.
   where the live transport records them, and no live run has been traced.
 - Traces are not stored. A caller that needs them must keep them.
 
-### 14.12 Day 9: demo listing of approved baselines (read-only, development only)
+### 14.12 Day 9: demo listing of approved baselines (read-only, development or hosted demo only)
 
 Status: **implemented.** Local development only, for the planned React dashboard.
 
@@ -2691,9 +2691,10 @@ which stored runs are approved baselines, so it cannot list or open incidents.
 **Decision.** Add one read-only route, `GET /api/v1/demo/baselines`. It returns the
 approved baselines that are also stored, sorted by run ID, with `data_origin` set to
 `synthetic`. An approved run that is not stored is left out, because the incident
-endpoints would refuse it with a 404. The route is registered only when
-`AEGIS_DEMO_API_ENABLED` is true. The settings refuse that flag in production, the
-same way they refuse the simulation endpoint.
+endpoints would refuse it with a 404. The route is registered when
+`AEGIS_DEMO_API_ENABLED` is true, or in hosted demo mode (section 14.13). The
+settings refuse that flag in production, the same way they refuse the simulation
+endpoint.
 
 **Unchanged.** Existing routes and response contracts are unchanged. The listing
 reads the trusted-baseline registry and the store. It does not start a simulation,
@@ -2706,6 +2707,63 @@ is acceptable because it can hold no more entries than the manifest approves. Th
 route has no authentication, so it carries the same loopback-only restriction as the
 simulation endpoint.
 
+
+### 14.13 Day 12: hosted synthetic demo mode (scoped policy decision)
+
+Status: **implemented, default off.** It is a single owner-approved exception to the
+production guards, for the synthetic demo only. It is not a deployment, and no host
+has been chosen or set up.
+
+**Gap.** The local demo depends on a seed step after every start and every API
+restart, and on a development manifest and flags. Neither works under
+`AEGIS_ENVIRONMENT=production`, which the settings refuse for the simulation
+endpoint, the demo flag, and the manifest path. A shareable demo needs the same data
+on each start, with no write path and no seed service.
+
+**Decision.** Add `AEGIS_HOSTED_DEMO_ENABLED` (default `false`) and
+`AEGIS_HOSTED_DEMO_SNAPSHOT_PATH`. With the flag on, the settings require
+`AEGIS_ENVIRONMENT=production` and a snapshot path, and the snapshot path is refused
+without the flag. At startup the API loads and verifies a committed, offline-approved
+snapshot (`demo/hosted_snapshot.json`), stores its runs, and serves the approvals.
+The baseline listing is registered in this mode and serves only those runs. Startup
+fails, and the server never starts, if the snapshot is missing or does not verify.
+
+**What the exception allows.** Only the synthetic demo data, and only the three fixed
+runs: normal-operation seeds 301 and 302 as approved baselines, and CPU saturation
+seed 311 as the fault run, each with 288 ticks. The listing and the incident routes
+read from the store.
+
+**What it does not allow.** The simulation endpoint stays refused and unregistered,
+so no route in this mode creates a run. The manifest path stays refused. The
+production refusals for the development flags still apply in full. The mode adds no
+write endpoint, no authentication, no paid model call, and no seed watcher. Those
+need their own approval under the Day 7 scope in `CLAUDE.md` and section 5.
+
+**Snapshot format and verification.** `scripts/build_hosted_snapshot.py` writes the
+snapshot from the simulator and the offline approval. It records, for each run, the
+spec, run ID, event count, anomaly count, a SHA-256 digest of the events, and, for a
+baseline, the approval (method and checked event count). It holds no events. Startup
+regenerates each run from its spec, which is deterministic, and refuses the whole
+snapshot on any difference: an unexpected spec, a run ID, count, or digest that does
+not match, or an approval that offline validation does not reproduce. It then checks
+that each approved baseline is stored with the same spec and event count. A test
+regenerates the snapshot and compares it with the committed file.
+
+**Guard summary.**
+
+| Setting | Ordinary production | Hosted demo mode |
+|---|---|---|
+| `AEGIS_SIMULATION_API_ENABLED=true` | Refused | Refused |
+| `AEGIS_DEMO_API_ENABLED=true` | Refused | Refused (the mode serves the listing) |
+| `AEGIS_TRUSTED_BASELINES_PATH` | Refused | Refused (the snapshot supplies approvals) |
+| `AEGIS_HOSTED_DEMO_ENABLED=true` | Refused (not production) | Accepted with a snapshot path |
+
+**Limitations.** Approval is by synthetic labels: it shows that a run contains no
+injected fault, not that it represents production traffic (section 13.12). The store
+is in memory, so a restart reloads the snapshot at startup. The API has no
+authentication, so the boundary depends on the proxy allowlist and on keeping the API
+private. Hosting still needs the TLS, networking, and owner decisions listed in
+`docs/demo.md`.
 
 ### Investigation usage and reference
 

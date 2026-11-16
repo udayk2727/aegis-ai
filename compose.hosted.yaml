@@ -1,0 +1,63 @@
+# Hosted synthetic demo. It runs the API with AEGIS_ENVIRONMENT=production and the
+# offline-approved snapshot in demo/hosted_snapshot.json, and nothing else: there is
+# no seed service and no approval step, so no service writes demo data at runtime.
+# The simulation endpoint, the demo flag, and the manifest stay refused. Only the
+# read-only dashboard is published, on the loopback address.
+#
+# This file is not a deployment. A public host still needs the TLS and networking
+# that docs/demo.md lists, and an owner decision on hosting. See the scoped policy
+# in docs/architecture.md.
+#
+# Start:  docker compose -f compose.hosted.yaml up --build -d
+# Health: http://127.0.0.1:8080/healthz (liveness), and the web container's health
+#         status, which is ready only when the two baselines are loaded.
+# Stop:   docker compose -f compose.hosted.yaml down
+
+name: aegis-hosted-demo
+
+x-backend-build: &backend-build
+  context: .
+  dockerfile: backend/Dockerfile
+
+services:
+  api:
+    build: *backend-build
+    environment:
+      AEGIS_ENVIRONMENT: production
+      AEGIS_HOSTED_DEMO_ENABLED: "true"
+      AEGIS_HOSTED_DEMO_SNAPSHOT_PATH: /config/hosted_snapshot.json
+    volumes:
+      - ./demo/hosted_snapshot.json:/config/hosted_snapshot.json:ro
+    # Internal only. The web service reaches it by the service name "api".
+    expose:
+      - "8000"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 2s
+
+  web:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -qO- http://127.0.0.1:8080/api/v1/demo/baselines | grep -q '"total":2'
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 2s

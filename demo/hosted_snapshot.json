@@ -1,0 +1,54 @@
+{
+  "data_origin": "synthetic",
+  "runs": [
+    {
+      "anomalous_event_count": 0,
+      "approval": {
+        "checked_event_count": 2592,
+        "method": "synthetic_ground_truth"
+      },
+      "event_count": 2592,
+      "events_sha256": "34e63ca32aa707965a11a3aad750b26e93edc98bd621437d8fb19e17cb33d231",
+      "run_id": "sim-66acab87815076b9",
+      "spec": {
+        "scenario": "normal_operation",
+        "seed": 301,
+        "start_time": "2026-01-01T00:00:00Z",
+        "tick_interval_seconds": 60,
+        "ticks": 288
+      }
+    },
+    {
+      "anomalous_event_count": 0,
+      "approval": {
+        "checked_event_count": 2592,
+        "method": "synthetic_ground_truth"
+      },
+      "event_count": 2592,
+      "events_sha256": "689bc267c0f96cd9b37a1f733993911af779e697fbc320656c0ef66df38c1ecd",
+      "run_id": "sim-a80b8a6ff8dfad18",
+      "spec": {
+        "scenario": "normal_operation",
+        "seed": 302,
+        "start_time": "2026-01-01T00:00:00Z",
+        "tick_interval_seconds": 60,
+        "ticks": 288
+      }
+    },
+    {
+      "anomalous_event_count": 864,
+      "approval": null,
+      "event_count": 2592,
+      "events_sha256": "fc260b9006e0e1cfd9d2fcf29935daa0f4e6d68c0e2373a3b91d914fc3bc22e4",
+      "run_id": "sim-c8ffd0c14e1c496c",
+      "spec": {
+        "scenario": "cpu_saturation",
+        "seed": 311,
+        "start_time": "2026-01-01T00:00:00Z",
+        "tick_interval_seconds": 60,
+        "ticks": 288
+      }
+    }
+  ],
+  "version": 1
+}

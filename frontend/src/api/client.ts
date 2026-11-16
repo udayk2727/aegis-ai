@@ -5,6 +5,8 @@ export const API_BASE = "/api/v1";
 
 export const BASELINES_URL = `${API_BASE}/demo/baselines`;
 
+const TEMPORARY_STATUSES = new Set([502, 503, 504]);
+
 /**
  * Error from a read request. It carries the API's fixed code and message, and
  * never a response body, stack trace, or path. ``status`` is null when the
@@ -69,7 +71,7 @@ export async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> 
   if (!response.ok) {
     const body = await readErrorBody(response);
     throw new ApiError(
-      body?.message ?? `The API returned status ${response.status}.`,
+      body?.message ?? statusMessage(response.status),
       response.status,
       body?.code ?? null,
     );
@@ -80,6 +82,17 @@ export async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> 
   } catch {
     throw new ApiError("The API returned a response that is not JSON.", response.status, null);
   }
+}
+
+/**
+ * The proxy answers 502 to 504 while the API container restarts, so those
+ * statuses say the outage is temporary. Every other status keeps the generic text.
+ */
+function statusMessage(status: number): string {
+  if (TEMPORARY_STATUSES.has(status)) {
+    return "The API is temporarily unavailable. It may be restarting, so try again in a few seconds.";
+  }
+  return `The API returned status ${status}.`;
 }
 
 /** Normalize anything a failed read throws into an ApiError the page can show. */

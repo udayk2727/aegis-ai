@@ -4,9 +4,10 @@
 # dashboard on 127.0.0.1.
 #
 # Start:  docker compose up --build -d
-# Seed:   docker compose --profile seed run --rm seed
 # Open:   http://127.0.0.1:8080
+# Health: http://127.0.0.1:8080/healthz
 # Stop:   docker compose down
+# The seed service loads the demo runs and reloads them after an API restart.
 # See docs/demo.md for the full steps and the restart behavior.
 
 name: aegis-demo
@@ -46,6 +47,7 @@ services:
       AEGIS_TRUSTED_BASELINES_PATH: /data/trusted_baselines.json
     volumes:
       - baselines:/data:ro
+    restart: unless-stopped
     # Internal only. The web service reaches it by the service name "api".
     expose:
       - "8000"
@@ -69,21 +71,31 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+    # Ready means the demo data is loaded, not only that nginx is up. The probe
+    # reads the proxied listing, so it fails while the API is down or empty.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -qO- http://127.0.0.1:8080/api/v1/demo/baselines | grep -q '"total":2'
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 2s
 
-  # Creates the demo runs in the running API. Run it on demand with:
-  # docker compose --profile seed run --rm seed
-  # It waits for the API's health probe itself, and it declares no dependencies,
-  # so running it never restarts or re-approves the other services.
+  # Creates the demo runs in the running API and keeps them loaded. The API
+  # keeps its store in memory, so a restart empties it; this service notices the
+  # short listing and loads the runs again. It waits for the API's health probe
+  # itself and declares no dependencies, so it never restarts another service.
   seed:
     build: *backend-build
-    profiles:
-      - seed
     command:
       - python
       - scripts/load_demo_seeds.py
       - --base-url
       - http://api:8000
-    restart: "no"
+      - --watch
+    restart: unless-stopped
 
 volumes:
   baselines:

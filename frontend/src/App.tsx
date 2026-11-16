@@ -16,7 +16,7 @@ export default function App() {
       <header className="app-header">
         <h1>Incident dashboard</h1>
         <p className="muted">
-          Synthetic demo data from the local API. Read-only. Hypotheses are
+          Synthetic demo data. Read-only. Hypotheses are
           unverified, and no root cause is assessed.
         </p>
       </header>
@@ -58,9 +58,9 @@ function DashboardBody({
       return (
         <EmptyPanel title="No approved baselines are stored" onRetry={onRetry}>
           <p>
-            Prepare the demo data as described in the README&apos;s Dashboard
-            section, then check again. The API needs the demo listing enabled
-            and both normal baseline runs stored.
+            The demo data is loading, or it was cleared when the API restarted.
+            The demo reloads it automatically within a few seconds, so check
+            again shortly.
           </p>
         </EmptyPanel>
       );
@@ -71,9 +71,9 @@ function DashboardBody({
           onRetry={onRetry}
         >
           <p>
-            The approved baselines are stored, but no fault run has produced an
-            incident. Run the fault scenario in the README&apos;s Dashboard
-            section, then check again.
+            The approved baselines are stored, but no incident has been detected
+            yet. The demo loads the fault run after the baselines, so check
+            again in a moment.
           </p>
         </EmptyPanel>
       );

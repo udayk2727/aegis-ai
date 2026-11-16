@@ -8,6 +8,10 @@ store, so run this again after one.
 
     python scripts/load_demo_seeds.py --base-url http://127.0.0.1:8000
 
+With ``--watch`` it stays running and reloads the runs whenever the listing shows
+fewer baselines than expected. That is how the Compose demo recovers from an API
+restart without a manual step. Watch mode never exits on its own.
+
 Uses only the standard library. Exit code 0 means the runs are loaded and the
 listing shows the two baselines. Exit code 1 means the API did not become ready,
 a request failed, or the listing was not what the demo expects.
@@ -30,6 +34,7 @@ FAULT_SPEC: dict[str, Any] = {"scenario": "cpu_saturation", "seed": 311, "ticks"
 EXPECTED_BASELINES = len(BASELINE_SPECS)
 READY_ATTEMPTS = 60
 READY_INTERVAL_SECONDS = 1.0
+WATCH_INTERVAL_SECONDS = 5.0
 REQUEST_TIMEOUT_SECONDS = 10.0
 ACCEPTED_CREATE_STATUSES = (200, 201)
 
@@ -98,13 +103,41 @@ def count_baselines(base_url: str, request: Request) -> int:
     return int(body["total"])
 
 
+def keep_demo_loaded(
+    base_url: str,
+    request: Request,
+    sleep: Callable[[float], None],
+    rounds: int | None = None,
+) -> None:
+    """Check the listing on each round and reload the runs when it is short.
+
+    A failed check is printed without a response body and retried on the next
+    round, so a restarting API does not stop the loop. ``rounds`` bounds the loop
+    for tests; the container runs it without a bound.
+    """
+    completed = 0
+    while rounds is None or completed < rounds:
+        completed += 1
+        try:
+            if count_baselines(base_url, request) != EXPECTED_BASELINES:
+                load_runs(base_url, request)
+                print("reloaded the demo runs after the listing was short")
+        except SeedError as error:
+            print(str(error), file=sys.stderr)
+        sleep(WATCH_INTERVAL_SECONDS)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Wait for the API, load the demo runs, and check the listing."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--watch", action="store_true")
     args = parser.parse_args(argv)
     base_url = args.base_url.rstrip("/")
 
+    if args.watch:
+        keep_demo_loaded(base_url, _http, time.sleep)
+        return 0
     if not wait_until_ready(base_url, _http, time.sleep):
         print("the API did not become ready", file=sys.stderr)
         return 1

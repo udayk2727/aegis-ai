@@ -88,6 +88,20 @@ describe("getJson", () => {
     });
   });
 
+  it("explains a proxy error during an API restart as temporary", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(new Response("<html>502 Bad Gateway</html>", { status: 502 })),
+    );
+
+    const error = await getJson("/api/v1/x").catch((caught: unknown) => caught);
+
+    expect(error).toMatchObject({ status: 502, code: null });
+    expect((error as Error).message).toContain("temporarily unavailable");
+  });
+
   it("uses a generic message when the error body is not the API shape", async () => {
     vi.stubGlobal(
       "fetch",

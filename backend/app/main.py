@@ -25,6 +25,11 @@ from app.routers import (
 )
 from app.services.event_store import DEFAULT_EVENT_CAPACITY, EventStore
 from app.services.baseline_trust import TrustedBaselines
+from app.services.hosted_demo import (
+    HostedDemoError,
+    load_hosted_demo,
+    store_hosted_runs,
+)
 from app.services.trusted_baselines import load_trusted_baselines
 
 
@@ -44,10 +49,21 @@ def create_app(
     the manifest named in the settings, otherwise none. With none, every incident
     request that names a baseline is refused. The demo listing is registered only
     when the settings enable it.
+
+    In hosted demo mode the store and the approvals come from the offline-approved
+    snapshot instead. A snapshot that is missing or does not verify raises
+    HostedDemoError here, so the module import fails and the server never starts.
     """
     if settings is None:
         settings = load_settings(os.environ)
-    if trusted_baselines is None:
+    event_store = EventStore(max_events=event_capacity)
+    if settings.hosted_demo_enabled:
+        if settings.hosted_demo_snapshot_path is None:
+            raise HostedDemoError("hosted demo mode needs a snapshot path")
+        hosted = load_hosted_demo(settings.hosted_demo_snapshot_path)
+        store_hosted_runs(event_store, hosted)
+        trusted_baselines = hosted.trusted
+    elif trusted_baselines is None:
         trusted_baselines = (
             load_trusted_baselines(settings.trusted_baselines_path)
             if settings.trusted_baselines_path is not None
@@ -58,7 +74,7 @@ def create_app(
         description="Autonomous Enterprise Incident Intelligence Platform",
         version=__version__,
     )
-    application.state.event_store = EventStore(max_events=event_capacity)
+    application.state.event_store = event_store
     application.state.trusted_baselines = trusted_baselines
     application.state.investigation_max_cited_events = (
         settings.investigation_max_cited_events
@@ -70,7 +86,7 @@ def create_app(
     application.include_router(analytics.router)
     application.include_router(incidents.router)
     application.include_router(investigations.router)
-    if settings.demo_api_enabled:
+    if settings.demo_api_enabled or settings.hosted_demo_enabled:
         application.include_router(demo.router)
     return application
 
