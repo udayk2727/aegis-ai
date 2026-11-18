@@ -8,6 +8,7 @@ The backend generates synthetic service metrics, compares them with
 normal baselines, and groups related alerts into incidents. I built
 a React dashboard to browse those incidents and see the evidence,
 possible causes, and suggested checks.
+![AEGIS AI dashboard showing a synthetic incident and its investigation](docs/images/incident-dashboard.png)
 
 ## Try the demo
 
@@ -29,6 +30,8 @@ read-only tools. Python checks the agent's selections against the
 incident evidence before accepting the report. I tested that
 workflow end to end on one synthetic incident.
 
+- [Portfolio walkthrough](docs/portfolio-walkthrough.md): the dashboard, the
+  Docker demo, the architecture, and the two investigation paths
 - [Architecture and design decisions](docs/architecture.md)
 - [Offline evaluation walkthrough](docs/offline-evaluation-demo.md)
 

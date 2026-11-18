@@ -3,7 +3,9 @@
 Commands for running AEGIS AI locally on Windows PowerShell: the initial setup,
 the offline verification pipeline, the read-only demo workflow, and the React
 dashboard. All data is synthetic. Every section here is for development only.
-For the project overview, see the [README](../README.md).
+For the project overview, see the [README](../README.md). For a guided tour of
+the dashboard and the two investigation paths, see the
+[portfolio walkthrough](portfolio-walkthrough.md).
 
 ## Getting started
 
